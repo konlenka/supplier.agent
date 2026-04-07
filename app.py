@@ -163,6 +163,15 @@ def run_weekly_order():
         send_sms(phone, confirmation)
 
 
+@app.route("/trigger")
+def manual_trigger():
+    """Secret URL to manually fire the weekly order job."""
+    if request.args.get("key") != "creme123":
+        return "Forbidden", 403
+    run_weekly_order()
+    return "Order job triggered.", 200
+
+
 # Set up the scheduler
 scheduler = BackgroundScheduler(timezone=MELBOURNE_TZ)
 scheduler.add_job(
