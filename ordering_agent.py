@@ -209,7 +209,7 @@ def run_order_agent(
     Returns an empty list if the agent determines no order is needed."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    messages: list[dict] = []
+    messages: list[dict] = [{"role": "user", "content": "Please calculate this week's milk order."}]
     final_order: list[OrderLine] | None = None
     iteration = 0
 
