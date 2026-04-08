@@ -73,7 +73,7 @@ def format_order_message(
     date_str = f"{order_date.day}/{order_date.month}/{str(order_date.year)[2:]}"
     order_by_item = {ol.item: ol.quantity for ol in order_lines}
 
-    lines = [date_str, ""]
+    lines = ["Hey Brent,", "", date_str, ""]
     for item_key, target in STOCK_TARGETS.items():
         short_label = target["label"].replace(" Milk", "")
         qty = order_by_item.get(item_key, 0)
