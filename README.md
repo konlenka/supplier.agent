@@ -178,14 +178,17 @@ While `APPROVER_PHONE_NUMBER` is set, no order reaches the supplier until that p
 
 1. When the order is worked out, it is texted to the approver with the stock counts it was worked out from. Staff get a text saying the order is waiting for approval.
 2. The approver replies by text:
-   - **Yes** (yes, y, yep, ok, approve, 👍, "send it"): the order they were shown goes to the supplier and staff get the usual summary.
-   - **No** (no, nope, "no, too much oat"): nothing is sent. Staff are asked to count again, and the new order comes back to the approver. This repeats for every no. The approver's reply is kept, so the reason for a no is on record.
-   - **Anything else**: nothing is sent and the system asks for YES or NO.
+   - **Yes** (yes, y, yep, ok, approve, 👍, "send it", optionally with "thanks" or "please"): the order they were shown goes to the supplier and staff get the usual summary.
+   - **No** (anything starting with no, nope, nah, not or don't, such as "no, too much oat"): nothing is sent. Staff are asked to count again, and the new order comes back to the approver. This repeats for every no. The approver's reply is kept, so the reason for a no is on record.
+   - **Anything else**: nothing is sent and the system asks for YES or NO. That includes a yes with anything added to it: "ok I'll check first", "yes make the oat 4" and "ok?" do not send the order. The approver cannot change quantities by text.
 3. If the approver doesn't answer, they get one reminder after 4 hours. After 24 hours the order is not sent, and the approver and staff are told to order by hand. A yes after that sends nothing.
+4. The approver also gets a text when a week ends with nothing for them to approve: no order was needed, or a count never came in.
 
 The reply is matched against a fixed list of words. No AI reads it.
 
-To end the trial, remove `APPROVER_PHONE_NUMBER` from the environment (Railway → Variables) and restart: orders then go straight to the supplier as before.
+**The approver should not reply STOP or CANCEL.** The system reads those as a no, but Twilio may also treat them as an unsubscribe and block every later text to that number until they text START. (Twilio's behaviour here has not been tested on this account.)
+
+To end the trial, remove `APPROVER_PHONE_NUMBER` from the environment (Railway → Variables) and restart: orders then go straight to the supplier as before. Do it when no order is waiting for approval. If one is waiting, it is cancelled at the restart, not sent, and staff are told to order by hand.
 
 ---
 

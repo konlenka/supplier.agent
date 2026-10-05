@@ -79,6 +79,9 @@ HANDLED_OUTCOMES = (
 # The 1pm reminder for a count the order is waiting on. Logged, but deliberately not in
 # ALL_OUTCOMES: it is not a run of the order job, and the week must still read as waiting.
 OUTCOME_CHASED = "chased"
+# The reminder to the approver about an order they have not answered. Kept out of
+# ALL_OUTCOMES for the same reason.
+OUTCOME_APPROVAL_CHASED = "approval_chased"
 
 ORDER_WEEKDAY = 2  # Wednesday (Monday is 0) — matches the scheduler below
 FORCE_COOLDOWN = timedelta(minutes=10)
@@ -516,6 +519,7 @@ def _place_order(today: date, force: bool) -> tuple[str, str]:
     if not order_lines:
         logger.info("All stock levels are sufficient — no order needed this week")
         _notify_employees("Stock levels are good — no order needed this week.")
+        _text_approver("Stock levels are good, so no order needed this week. Nothing for you to approve.")
         return OUTCOME_NO_ORDER_NEEDED, detail
 
     if APPROVER_PHONE_NUMBER:
@@ -606,32 +610,58 @@ def _ask_for_approval(
 
 # How the approver's reply is read. A fixed list, not a model: whether an order goes must
 # not rest on a guess. Anything the list does not settle is asked again.
-_YES_OPENERS = {"yes", "y", "yep", "yeah", "yup", "ya", "ok", "okay", "approve", "approved", "confirm", "confirmed"}
-# Looser ways to say yes count only when they are the whole reply: "send it" is a yes,
-# "send me the count again" is not.
-_YES_WHOLE_REPLIES = {"send", "send it", "go", "go ahead", "sure", "do it", "k"}
+_YES_OPENERS = {
+    "yes", "y", "yep", "yeah", "yup", "ya", "ok", "okay", "k", "sure",
+    "approve", "approved", "confirm", "confirmed",
+}
+# Other ways to start a yes: "send it" is one, "send me the count again" is not.
+_YES_WHOLE_REPLIES = {"send", "send it", "go", "go ahead", "do it", "all good", "looks good"}
+# The only things that may follow a yes and leave it a yes. "Ok" is how people acknowledge
+# a text as well as how they agree to it, so "ok I'll check the fridge first", "yes make the
+# oat 4", "ok?" and "ok, is that all" are not a yes: anything but these phrases, a number
+# or a question mark, and the reply is asked again. Whole phrases, not loose words — loose
+# words recombine into things nobody meant as a yes.
+_YES_TAILS = {
+    "please", "pls", "thanks", "thx", "ty", "cheers", "mate", "perfect", "great", "good", "fine",
+    "correct", "sounds good", "thats fine", "thats correct", "thats right", "thats good", "thats great",
+}
 _NO_OPENERS = {"no", "n", "nope", "nah", "not", "dont", "stop", "cancel", "reject", "rejected", "wrong"}
-# A yes followed by any of these is not a plain yes ("yes but make the oat 4").
-_DOUBT_WORDS = _NO_OPENERS | {"but", "wait", "hold", "except", "change", "instead", "unless", "if"}
 _THUMBS_UP, _THUMBS_DOWN = "\U0001F44D", "\U0001F44E"
+
+
+def _phrases(texts: set[str]) -> list[tuple[str, ...]]:
+    """Phrases as word tuples, longest first, so "send it" is tried before "send"."""
+    return sorted((tuple(text.split()) for text in texts), key=len, reverse=True)
+
+
+_YES_START_PHRASES = _phrases(_YES_OPENERS | _YES_WHOLE_REPLIES)
+_YES_TAIL_PHRASES = _phrases(_YES_OPENERS | _YES_WHOLE_REPLIES | _YES_TAILS)
+
+
+def _drop_phrase(words: list[str], phrases: list[tuple[str, ...]]) -> list[str] | None:
+    """The words left once one of `phrases` is taken off the front, or None if none fits."""
+    for phrase in phrases:
+        if tuple(words[:len(phrase)]) == phrase:
+            return words[len(phrase):]
+    return None
 
 
 def _read_approval_reply(body: str) -> bool | None:
     """True for a yes, False for a no, None when it is neither or it is unclear. Leans
     towards no: a wrong no costs a phone call, a wrong yes costs an order."""
-    text = body.strip().lower().replace("'", "").replace("\u2019", "")
+    text = body.strip().lower().replace("'", "").replace("\u2019", "").replace("thank you", "thanks")
     words = re.findall(r"[a-z]+", text)
+    thumbs_up, thumbs_down = _THUMBS_UP in text, _THUMBS_DOWN in text
     if not words:
-        if text.startswith(_THUMBS_UP):
-            return True
-        return False if text.startswith(_THUMBS_DOWN) else None
+        return thumbs_up if thumbs_up != thumbs_down else None
     if words[0] in _NO_OPENERS:
         return False
-    if " ".join(words) in _YES_WHOLE_REPLIES:
-        return True
-    if words[0] in _YES_OPENERS and not _DOUBT_WORDS.intersection(words[1:]):
-        return True
-    return None
+    if thumbs_down or re.search(r"[0-9?]", text):
+        return None
+    rest = _drop_phrase(words, _YES_START_PHRASES)
+    while rest:
+        rest = _drop_phrase(rest, _YES_TAIL_PHRASES)
+    return True if rest == [] else None
 
 
 NOTHING_WAITING = "There's no milk order waiting for approval. Nothing was sent just now."
@@ -655,7 +685,9 @@ def _answer_from_approver(body: str) -> str | None:
     with _order_lock:
         approval = storage.get_pending_approval()
         if approval is None:
-            if decision is None and APPROVER_PHONE_NUMBER in EMPLOYEE_PHONE_NUMBERS:
+            # With nothing waiting, a text from an approver who also counts stock is a count
+            # unless it is a bare yes — "No almond left, oat 6" is a count, not an answer.
+            if not decision and APPROVER_PHONE_NUMBER in EMPLOYEE_PHONE_NUMBERS:
                 return None
             return NOTHING_WAITING
         if datetime.now(timezone.utc) - approval.requested_at >= WAIT_FOR_APPROVAL:
@@ -714,6 +746,19 @@ def _turn_down_order(approval: Approval, reply: str) -> str:
     if not storage.decide_approval(approval.id, storage.APPROVAL_REJECTED, reply):
         return NOTHING_WAITING
     logger.warning("The approver turned down this week's order — asking staff to count again")
+    if _ask_for_recount() == 0:
+        return (
+            "OK, nothing was sent to the supplier. But the request to count again could not be "
+            "texted to staff. Please ask them to count and send it, or place the order by hand."
+        )
+    return (
+        "OK, nothing was sent to the supplier. Staff have been asked to count again, "
+        "and you'll get the new order to approve."
+    )
+
+
+def _ask_for_recount() -> int:
+    """Ask staff to count again after a no. Returns how many of them the text reached."""
     reached = _notify_employees(_recount_request())
     # Logged as a request for a count, so everything that follows one applies here too:
     # the reminder, the closing text after a day, and a complete count releasing the
@@ -724,10 +769,7 @@ def _turn_down_order(approval: Approval, reply: str) -> str:
         f"order not approved; recount asked; told {reached} of {len(EMPLOYEE_PHONE_NUMBERS)} staff",
     )
     _schedule_follow_ups()
-    return (
-        "OK, nothing was sent to the supplier. Staff have been asked to count again, "
-        "and you'll get the new order to approve."
-    )
+    return reached
 
 
 def _close_unanswered(approval: Approval) -> bool:
@@ -789,6 +831,7 @@ def chase_approval(final: bool = False) -> None:
                     APPROVER_PHONE_NUMBER,
                     "Reminder: still waiting for your answer.\n\n" + build_approval_request(approval),
                 )
+                _log_run(_melbourne_today(), OUTCOME_APPROVAL_CHASED, "approver reminded")
         except Exception:
             logger.exception("Could not check or send the approval follow-up")
 
@@ -874,11 +917,13 @@ def chase_missing_count(final: bool = False) -> list[str]:
                 # an open request that reaches its deadline means no order went out.
                 logger.warning("Closing this week's order — no order was placed (missing: %s)", names or "nothing")
                 reason = f"No stock count came in for: {names}, so this" if missing else "This"
-                reached = _notify_employees(
+                closing = (
                     f"{reason} week's milk order has NOT been placed and the automatic order "
                     "is closed for this week. Please order from the supplier by hand. The next "
                     "automatic order is next Wednesday."
                 )
+                reached = _notify_employees(closing)
+                _text_approver(closing)  # on trial they may be waiting on an order to approve
                 storage.log_run(
                     today,
                     OUTCOME_CLOSED,
@@ -963,6 +1008,59 @@ def _schedule_follow_ups() -> None:
         logger.exception("Could not schedule the follow-ups for the stock count request")
 
 
+def _recover_interrupted_no() -> None:
+    """Run at startup. If the approver's no was recorded and nothing was logged after it,
+    the process died before staff were asked to count again: the week would sit open with
+    no request, no follow-ups and nobody told. Ask now. Staff may get the request twice
+    if the first one had already gone; that is the cheap side of not knowing."""
+    with _order_lock:
+        try:
+            turned_down = _turned_down_at()
+            last_run = storage.get_last_run(ALL_OUTCOMES)
+            if turned_down is None or (last_run and last_run.at >= turned_down):
+                return
+            logger.error("A no from the approver was cut off before staff were asked to recount")
+            _ask_for_recount()
+        except Exception:
+            logger.exception("Could not check for a no cut off by a restart")
+
+
+def _drop_orphaned_approval() -> None:
+    """Run at startup. If approval has been switched off while an order was waiting on it,
+    nobody can answer that order any more: without this it stays "waiting", the week stays
+    skipped, and a follow-up later tells staff a story that may no longer be true. It was
+    held for a check it never got, so it is not sent. Cancel it and say so."""
+    with _order_lock:
+        try:
+            if APPROVER_PHONE_NUMBER:
+                return
+            approval = storage.get_pending_approval()
+            if approval is None or not storage.decide_approval(approval.id, storage.APPROVAL_CANCELLED):
+                return
+            logger.warning("Approval was switched off with an order waiting on it — cancelling that order")
+            reached = _notify_employees(
+                "This week's milk order was waiting for approval when approval was switched "
+                "off, so it has NOT been sent to the supplier. Please order by hand. The next "
+                "automatic order is next Wednesday."
+            )
+            _log_run(
+                approval.order_date,
+                OUTCOME_NOT_APPROVED,
+                f"approval switched off with an order waiting; told {reached} of {len(EMPLOYEE_PHONE_NUMBERS)} staff",
+            )
+        except Exception:
+            logger.exception("Could not check for an order left waiting on a switched-off approval")
+
+
+def _resume_after_restart() -> None:
+    """Everything that lived in memory, or was cut off part-way, when the process last stopped."""
+    _schedule_follow_ups()  # a request for a count that was open before the restart
+    _drop_orphaned_approval()  # approval switched off while an order was waiting on it
+    _schedule_approval_follow_ups()  # an order that was with the approver before the restart
+    _recover_interrupted_send()  # a yes that was taken just as the process went down
+    _recover_interrupted_no()  # a no that was taken just as the process went down
+
+
 def _schedule_approval_follow_ups() -> None:
     """Book the reminder and the closing text for the order waiting on the approver now.
     Timed from when they were asked, like the follow-ups for a count, and for the same
@@ -1009,9 +1107,7 @@ if __name__ == "__main__":
     storage.init_db()
     scheduler.start()
     logger.info("Scheduler started — weekly order runs every Wednesday at 9:00 AM Melbourne time")
-    _schedule_follow_ups()  # a request for a count that was open before the restart
-    _schedule_approval_follow_ups()  # an order that was with the approver before the restart
-    _recover_interrupted_send()  # a yes that was taken just as the process went down
+    _resume_after_restart()
     if _missed_todays_run(datetime.now(timezone.utc)):
         logger.warning("Today's 9:00 order run was missed — running it now")
         threading.Thread(target=run_weekly_order, daemon=True).start()

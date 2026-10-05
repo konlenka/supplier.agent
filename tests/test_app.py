@@ -945,6 +945,7 @@ def test_an_order_asked_late_in_the_week_and_never_answered_does_not_cancel_next
 @pytest.mark.parametrize("body", [
     "yes", "Yes.", "YES!", "y", "yep", "yeah", "yup", "ok", "Okay", "ok thanks", "yes please",
     "yep send it", "approve", "approved", "confirm", "send it", "Send", "go ahead", "sure", "\U0001F44D",
+    "ok thank you", "Yes, go ahead", "yes that's fine", "all good", "looks good", "ok do it", "ok \U0001F44D",
 ])
 def test_replies_read_as_yes(body):
     assert app_module._read_approval_reply(body) is True
@@ -962,6 +963,12 @@ def test_replies_read_as_no(body):
 @pytest.mark.parametrize("body", [
     "", "?", "what's this", "who is this", "yes but make the oat 4", "yes no", "ok wait",
     "send me the count again", "I'll go check the fridge", "go check with Sam first",
+    # A yes-word followed by anything but thanks is an acknowledgement or a change, not a yes.
+    "Ok I'll check the fridge first", "yes make the oat 4", "ok i already ordered by hand", "ok?",
+    "Yes? Who's this", "Ok hang on", "ok later", "Yes, add 2 soy", "ok that's too much oat",
+    "Okay doesn't look right", "Confirm the oat count first", "Yep will check with Sam first",
+    "\U0001F44D\U0001F44E", "yes \U0001F44E", "yes 4", "ok you do it", "Ok new count almond 12 oat 8",
+    "is that correct", "thanks mate", "it looks fine", "ok, is that all",
     "sure thing mate, what is it", "good morning", "do not send", "maybe", "8 almond 3 soy",
 ])
 def test_replies_that_are_neither_are_not_guessed(body):
@@ -1126,7 +1133,9 @@ def test_no_recount_within_a_day_closes_the_week(bot, sms, boss):
     app_module.chase_missing_count(final=True)
 
     assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_CLOSED
-    assert all("by hand" in body for _, body in bot) and len(bot) == len(STAFF)
+    # The boss was told they would get a new order to approve, so they hear that none is coming.
+    assert all("by hand" in body for _, body in bot) and len(bot) == len(STAFF) + 1
+    assert len(_to_boss(bot)) == 1
     bot.clear()
     assert "Stock updated" in sms("late recount", RECOUNT)  # only records stock now
     assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
@@ -1436,6 +1445,184 @@ def test_next_weeks_request_replaces_one_the_boss_never_answered(bot, boss, monk
     assert len(supplier_msgs) == 1
     assert "Oat * 2" in supplier_msgs[0] and "Almond * 0" in supplier_msgs[0]
     assert [status for status, _ in _approvals()] == ["superseded", "approved"]
+
+
+def test_a_boss_who_also_counts_stock_has_a_recount_starting_with_no_saved_as_a_count(bot, sms, monkeypatch):
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", STAFF[0])
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    client = app_module.app.test_client()
+    client.post("/sms", data={"From": STAFF[0], "Body": "no"})  # their own no: recount asked
+    bot.clear()
+
+    reply = sms("No almond left, oat 6, rest full", {**RECOUNT, "almond_milk": StockLevel("almond_milk", 0, "boxes")}, sender=STAFF[0])
+
+    assert "no milk order waiting" not in reply
+    assert storage.get_current_stock()["almond_milk"].quantity == 0
+    assert _to_supplier(bot) == []
+
+
+def test_a_count_texted_by_the_boss_while_an_order_waits_does_not_approve_it(bot, sms, monkeypatch):
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", STAFF[0])
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    bot.clear()
+
+    reply = sms("Ok new count almond 12 oat 8", FULL_STOCK, sender=STAFF[0])
+
+    assert _to_supplier(bot) == []
+    assert "YES" in reply and "NO" in reply
+    assert storage.get_pending_approval() is not None
+
+
+def test_two_requests_acting_on_the_same_waiting_order_send_it_once(bot, boss):
+    """Two webhook requests can both read the order as waiting before either acts on it.
+    Whichever claims it second must send nothing — whatever the lock around them does."""
+    pending = _order_waiting_for_the_boss(bot)
+
+    app_module._send_approved_order(pending, "yes")
+    second = app_module._send_approved_order(pending, "yes")
+
+    assert len(_to_supplier(bot)) == 1
+    assert "Nothing was sent" in second
+
+
+def test_a_no_or_a_closing_text_acting_on_an_order_already_dealt_with_does_nothing(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+    app_module._send_approved_order(pending, "yes")
+    bot.clear()
+
+    assert "Nothing was sent" in app_module._turn_down_order(pending, "no")
+    assert app_module._close_unanswered(pending) is False
+
+    assert bot == []
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_ORDERED
+
+
+def test_simultaneous_yeses_send_one_order(bot, monkeypatch):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", BOSS)
+    monkeypatch.setattr(app_module, "validate_twilio_request", lambda url, params, sig: True)
+    _order_waiting_for_the_boss(bot)
+    sent = bot
+
+    def slow_send(to, body):
+        time.sleep(0.05)  # long enough for the other requests to be mid-flight
+        sent.append((to, body))
+
+    monkeypatch.setattr(app_module, "send_sms", slow_send)
+
+    def yes(_):
+        return app_module.app.test_client().post("/sms", data={"From": BOSS, "Body": "yes"}).get_data(as_text=True)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        replies = list(pool.map(yes, range(4)))
+
+    assert len(_to_supplier(sent)) == 1
+    assert sum("Sent to the supplier" in reply for reply in replies) == 1
+
+
+def test_a_no_that_reaches_no_staff_tells_the_boss_so(bot, boss, monkeypatch):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+
+    def send(to, body):
+        raise RuntimeError("twilio down")
+
+    monkeypatch.setattr(app_module, "send_sms", send)
+
+    reply = boss("no")
+
+    assert "Staff have been asked" not in reply
+    assert "could not be texted to staff" in reply and "by hand" in reply
+
+
+def test_a_recount_that_needs_no_order_tells_the_boss_too(bot, sms, boss):
+    _held_order_turned_down(bot, boss)
+    bot.clear()
+
+    sms("recount", FULL_STOCK)  # nothing is short after all
+
+    assert _to_supplier(bot) == []
+    assert any("no order needed" in body for body in _to_boss(bot))
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_NO_ORDER_NEEDED
+
+
+def test_a_no_cut_off_before_staff_were_asked_is_picked_up_after_a_restart(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+    _clear_follow_up_jobs()
+    # The process died after the no was recorded and before the recount was asked for.
+    storage.decide_approval(pending.id, storage.APPROVAL_REJECTED, "no")
+
+    app_module._recover_interrupted_no()
+    app_module._recover_interrupted_no()  # every restart runs this; it must ask once
+
+    assert len(bot) == len(STAFF) and all("count the milk again" in body for _, body in bot)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_STALE
+    assert "chase_count_final" in _follow_up_jobs()
+
+
+def test_a_no_that_was_fully_handled_is_left_alone_after_a_restart(bot, boss):
+    _held_order_turned_down(bot, boss)
+    bot.clear()
+
+    app_module._recover_interrupted_no()
+
+    assert bot == []
+
+
+def test_switching_approval_off_while_an_order_waits_cancels_it_and_tells_staff(bot, boss, monkeypatch):
+    _order_waiting_for_the_boss(bot)
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", "")  # the variable was removed; restart
+
+    app_module._drop_orphaned_approval()
+
+    assert _to_supplier(bot) == []
+    assert all("NOT been sent" in body and "by hand" in body for _, body in bot) and len(bot) == len(STAFF)
+    assert [status for status, _ in _approvals()] == ["cancelled"]
+    bot.clear()
+    # Nothing is left for a follow-up to act on, so staff are not told a second story later.
+    _backdate_approvals(timedelta(hours=25))
+    app_module.chase_approval()
+    app_module.chase_approval(final=True)
+    assert bot == []
+
+
+def test_an_order_still_waiting_is_untouched_at_startup_while_approval_is_on(bot, boss):
+    _order_waiting_for_the_boss(bot)
+
+    app_module._drop_orphaned_approval()
+
+    assert bot == [] and storage.get_pending_approval() is not None
+
+
+def test_no_reminder_is_attempted_with_no_approver_number(bot, boss, monkeypatch):
+    _order_waiting_for_the_boss(bot)
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", "")
+
+    app_module.chase_approval()
+
+    assert bot == []
+
+
+def test_the_reminder_to_the_boss_is_in_the_run_log(bot, boss):
+    _order_waiting_for_the_boss(bot)
+
+    app_module.chase_approval()
+
+    assert _run_details(app_module.OUTCOME_APPROVAL_CHASED) == ["approver reminded"]
+    # It is a follow-up, not a run of the order job: the week still reads as waiting on them.
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_AWAITING_APPROVAL
+
+
+def test_the_approver_number_is_matched_however_it_was_typed():
+    import config
+
+    assert config._phone(" +61 400-000 009 ") == "+61400000009"
+    assert config._phone("(+61)400000009") == "+61400000009"
+    assert config._phone("") == ""
 
 
 def test_with_no_approver_set_nothing_is_held(bot):

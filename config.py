@@ -1,7 +1,14 @@
 import os
+import re
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _phone(value: str) -> str:
+    """A phone number as Twilio reports a sender: no spaces, dashes or brackets."""
+    return re.sub(r"[\s\-()]", "", value)
 
 # Twilio
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -18,7 +25,9 @@ EMPLOYEE_PHONE_NUMBERS = [
 
 # Who approves each order before it goes to the supplier, while the bot is on trial.
 # Set it and every order waits for their yes; leave it empty and orders go straight out.
-APPROVER_PHONE_NUMBER = os.getenv("APPROVER_PHONE_NUMBER", "").strip()
+# Matched exactly against the sender of a reply, so it is tidied here: typed as
+# "+61 400 000 009", no yes would ever be recognised as the approver's.
+APPROVER_PHONE_NUMBER = _phone(os.getenv("APPROVER_PHONE_NUMBER", ""))
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
