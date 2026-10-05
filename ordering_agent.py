@@ -121,6 +121,32 @@ TOOL_DEFINITIONS = [
 ]
 
 
+def _order_problem(order_items: object) -> str | None:
+    """Return what is wrong with a submitted order, or None if it is well-formed.
+    The message goes back to the agent so it can resubmit."""
+    if not isinstance(order_items, list):
+        return "order must be an array of {item_key, quantity_boxes}."
+
+    seen: set[str] = set()
+    for item in order_items:
+        if not isinstance(item, dict):
+            return "Each order entry must be an object with item_key and quantity_boxes."
+        key = item.get("item_key")
+        qty = item.get("quantity_boxes")
+        if key not in STOCK_TARGETS:
+            return f"Unknown item_key: {key!r}. Valid keys: {sorted(STOCK_TARGETS)}."
+        if key in seen:
+            return f"Duplicate item_key: {key}. List each item once."
+        seen.add(key)
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty < 0:
+            return f"quantity_boxes for {key} must be a whole number of boxes, 0 or more."
+
+    missing = set(STOCK_TARGETS) - seen
+    if missing:
+        return f"Missing items in order: {sorted(missing)}. Include all 5 items."
+    return None
+
+
 def _execute_tool(
     tool_name: str,
     tool_input: dict,
@@ -173,21 +199,15 @@ def _execute_tool(
         reasoning = tool_input.get("reasoning", "")
         logger.info("Agent order reasoning: %s", reasoning)
 
-        expected_keys = set(STOCK_TARGETS.keys())
-        provided_keys = {item["item_key"] for item in order_items}
-        missing = expected_keys - provided_keys
-        if missing:
-            error = {
-                "status": "error",
-                "message": f"Missing items in order: {sorted(missing)}. Include all 5 items.",
-            }
-            return json.dumps(error), None
+        problem = _order_problem(order_items)
+        if problem:
+            return json.dumps({"status": "error", "message": problem}), None
 
         order_lines = []
         for item in order_items:
             item_key = item["item_key"]
-            qty = int(item["quantity_boxes"])
-            if qty > 0 and item_key in STOCK_TARGETS:
+            qty = item["quantity_boxes"]
+            if qty > 0:
                 label = STOCK_TARGETS[item_key]["label"]
                 order_lines.append(OrderLine(item=item_key, label=label, quantity=qty))
 

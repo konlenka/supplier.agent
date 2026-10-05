@@ -20,7 +20,7 @@ Texts the order to supplier
 Texts a confirmation summary to all employees
 ```
 
-No human input required on ordering day — it runs fully automatically.
+No human input required on ordering day — it runs fully automatically. The quantities are capped in code at what the stock arithmetic allows, so the AI step can trim an order but never inflate one.
 
 ---
 
@@ -66,10 +66,12 @@ TWILIO_PHONE_NUMBER=+61xxxxxxxxx
 SUPPLIER_PHONE_NUMBER=+61xxxxxxxxx
 EMPLOYEE_PHONE_NUMBERS=+61xxxxxxxxx,+61xxxxxxxxx
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
+TRIGGER_KEY=a-long-random-string
 ```
 
 | Variable | Where to get it |
 |----------|----------------|
+| `TRIGGER_KEY` | Make one up (long and random). Unlocks the manual `/trigger` URL; leave empty to switch that URL off |
 | `TWILIO_ACCOUNT_SID` | [Twilio Console](https://console.twilio.com) → Account Info |
 | `TWILIO_AUTH_TOKEN` | Twilio Console → Account Info |
 | `TWILIO_PHONE_NUMBER` | The Australian number you buy in Twilio |
@@ -128,6 +130,10 @@ python trigger_order.py
 
 This fires the full order flow immediately — sends real SMS to supplier and employees.
 
+On the deployed server the same job runs from `https://your-app.railway.app/trigger?key=<TRIGGER_KEY>`.
+If this week's order (Wednesday to Tuesday) is already handled the job skips rather than ordering twice;
+add `&force=1` to send anyway. A forced send within 10 minutes of the last order is refused.
+
 ### Run unit tests
 
 ```bash
@@ -146,7 +152,11 @@ Almond: 3 boxes, Oat: 1, Soy: 4, LF: 12 bottles, Coconut: 8 bottles
 
 The system replies with a confirmation of what it recorded.
 
-If no stock report is received within 3 days of Wednesday, the system automatically texts employees asking for an update before placing the order.
+A message that doesn't contain a recognisable stock count is not recorded; the sender gets the format back.
+
+If any item has no count from the last 3 days when Wednesday 9am comes, the system texts employees naming the items it needs and holds the order. The order goes out as soon as every item has a fresh count.
+
+If the job fails before the order is sent, employees get a text saying nothing went to the supplier, so the order can be placed by hand. If the send itself errors, the text says the order may not have reached the supplier and to check with them first — the system won't re-send it on its own.
 
 ---
 

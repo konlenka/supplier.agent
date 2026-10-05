@@ -3,6 +3,9 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from stock_parser import parse_stock_sms, format_confirmation
 from models import StockLevel
 
@@ -58,6 +61,29 @@ def test_parse_bottles_unit(mock_anthropic_cls):
     result = parse_stock_sms("4 lactose free bottles and 3 coconut bottles")
     assert result["lactose_free"].unit == "bottles"
     assert result["coconut"].quantity == 3
+
+
+@pytest.mark.parametrize(
+    "model_output",
+    [
+        "{}",  # "thanks!" — nothing to record
+        '{"cow_milk": {"quantity": 3, "unit": "boxes"}}',  # not an item the cafe orders
+        '{"almond_milk": {"quantity": 3, "unit": "cartons"}}',
+        '{"almond_milk": {"quantity": -2, "unit": "boxes"}}',
+        '{"almond_milk": {"quantity": 1200, "unit": "boxes"}}',
+        '{"almond_milk": {"quantity": "three", "unit": "boxes"}}',
+        '{"almond_milk": 3}',
+        "[]",
+    ],
+)
+@patch("stock_parser.anthropic.Anthropic")
+def test_bad_parse_is_rejected_not_saved_as_stock(mock_anthropic_cls, model_output):
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    mock_client.messages.create.return_value = _mock_anthropic_response(model_output)
+
+    with pytest.raises(ValueError):
+        parse_stock_sms("whatever the employee sent")
 
 
 def test_format_confirmation():

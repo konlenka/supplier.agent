@@ -4,7 +4,7 @@ import sqlite3
 from datetime import date, datetime, timezone
 
 from config import DB_PATH, STOCK_TARGETS
-from models import OrderLine, StockLevel
+from models import JobRun, OrderLine, StockLevel
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -39,6 +39,13 @@ def init_db() -> None:
                 created_at TIMESTAMP NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_order_history_date ON order_history(order_date);
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date   TEXT NOT NULL,
+                outcome    TEXT NOT NULL,
+                detail     TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            );
         """)
         conn.commit()
     finally:
@@ -86,17 +93,6 @@ def get_current_stock() -> dict[str, StockLevel]:
         conn.close()
 
 
-def get_latest_report_time() -> datetime | None:
-    conn = _get_connection()
-    try:
-        row = conn.execute("SELECT MAX(reported_at) as latest FROM stock_reports").fetchone()
-        if row and row["latest"]:
-            return datetime.fromisoformat(row["latest"])
-        return None
-    finally:
-        conn.close()
-
-
 def save_order(order_date: date, order_lines: list[OrderLine]) -> None:
     """Persist a completed order to history. Idempotent — replaces any existing rows for that date."""
     date_str = order_date.isoformat()
@@ -111,6 +107,41 @@ def save_order(order_date: date, order_lines: list[OrderLine]) -> None:
                     (date_str, ol.item, ol.quantity, now),
                 )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def log_run(run_date: date, outcome: str, detail: str = "") -> None:
+    """Record one run of the weekly order job: when, what it decided, what it did."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO job_runs (run_date, outcome, detail, created_at) VALUES (?, ?, ?, ?)",
+            (run_date.isoformat(), outcome, detail, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_last_run(outcomes: tuple[str, ...]) -> JobRun | None:
+    """Most recent run with one of the given outcomes."""
+    placeholders = ",".join("?" for _ in outcomes)
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            f"SELECT run_date, outcome, created_at FROM job_runs WHERE outcome IN ({placeholders}) "
+            "ORDER BY id DESC LIMIT 1",
+            outcomes,
+        ).fetchone()
+        if row:
+            return JobRun(
+                run_date=date.fromisoformat(row["run_date"]),
+                outcome=row["outcome"],
+                at=datetime.fromisoformat(row["created_at"]),
+            )
+        return None
     finally:
         conn.close()
 

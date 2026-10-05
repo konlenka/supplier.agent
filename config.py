@@ -19,6 +19,9 @@ EMPLOYEE_PHONE_NUMBERS = [
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
+# Key for the manual /trigger URL. Unset means the URL is switched off.
+TRIGGER_KEY = os.getenv("TRIGGER_KEY", "")
+
 # Stock targets — order up to target_max
 # unit: "boxes" means the target is in boxes, "bottles" means target is in bottles
 STOCK_TARGETS = {
@@ -63,3 +66,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data", "stock.db")
 
 # Staleness threshold in days — if stock report is older than this, request an update
 STALE_THRESHOLD_DAYS = 3
+
+# An order sent within this many days blocks another one, so a restart, a retry or the
+# manual trigger can't send the supplier the same order twice in one week.
+MIN_DAYS_BETWEEN_ORDERS = 6
