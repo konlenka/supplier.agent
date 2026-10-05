@@ -22,3 +22,12 @@ class OrderLine:
     item: str           # e.g. "almond_milk"
     label: str          # e.g. "Almond Milk"
     quantity: int       # number of boxes to order
+
+
+@dataclass
+class Approval:
+    id: int
+    order_date: date                # the cafe's date when the approver was asked
+    order_lines: list[OrderLine]    # the order exactly as the approver was shown it
+    counts: dict[str, StockLevel]   # the stock counts it was worked out from
+    requested_at: datetime          # when the approver was asked (UTC)

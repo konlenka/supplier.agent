@@ -41,6 +41,7 @@ def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "send_sms", lambda to, body: sent.append((to, body)) or "SID")
     monkeypatch.setattr(app_module, "SUPPLIER_PHONE_NUMBER", SUPPLIER)
     monkeypatch.setattr(app_module, "EMPLOYEE_PHONE_NUMBERS", STAFF)
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", "")  # approval off unless a test turns it on
     monkeypatch.setattr(app_module, "_melbourne_today", lambda: WEDNESDAY)
     return sent
 
@@ -823,3 +824,341 @@ def test_trigger_is_off_without_a_configured_key(bot, monkeypatch):
 
     assert client.get("/trigger?key=a-long-random-key").status_code == 200
     assert client.get("/trigger", headers={"X-Trigger-Key": "a-long-random-key"}).status_code == 200
+
+
+# --- Approval before the order goes to the supplier (the trial period) ---
+
+BOSS = "+61400000009"
+STAFF_WAITING = "waiting for approval"
+
+
+@pytest.fixture
+def boss(bot, sms, monkeypatch):
+    """Approval switched on, with a boss who is not one of the staff numbers. Returns a
+    function that texts the bot as the boss and gives back the bot's reply."""
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", BOSS)
+    client = app_module.app.test_client()
+
+    def text(body, sender=BOSS):
+        return client.post("/sms", data={"From": sender, "Body": body}).get_data(as_text=True)
+
+    return text
+
+
+def _to_boss(sent, number=BOSS):
+    return [body for to, body in sent if to == number]
+
+
+def _backdate_approvals(delta):
+    """Make every approval request look `delta` older."""
+    conn = storage._get_connection()
+    try:
+        for row in conn.execute("SELECT id, requested_at FROM order_approvals").fetchall():
+            older = (datetime.fromisoformat(row["requested_at"]) - delta).isoformat()
+            conn.execute("UPDATE order_approvals SET requested_at = ? WHERE id = ?", (older, row["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _approvals():
+    conn = storage._get_connection()
+    try:
+        rows = conn.execute("SELECT status, reply FROM order_approvals ORDER BY id").fetchall()
+        return [(row["status"], row["reply"]) for row in rows]
+    finally:
+        conn.close()
+
+
+def test_with_approval_on_the_order_goes_to_the_boss_and_not_the_supplier(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+
+    assert _to_supplier(bot) == []
+    request = _to_boss(bot)
+    assert len(request) == 1
+    # The order as the supplier would get it, and the counts it was worked out from.
+    for line in ("Almond * 4", "Oat * 0", "Soy * 4", "Lactose Free * 0", "Coconut * 1"):
+        assert line in request[0]
+    for count in ("Almond 8 boxes", "Soy 3 boxes", "Lactose Free 7 bottles", "Coconut 2 bottles"):
+        assert count in request[0]
+    assert "YES" in request[0] and "NO" in request[0]
+    # Staff hear something too: silence on a Wednesday means "it did not run".
+    for number in STAFF:
+        assert any(STAFF_WAITING in body for to, body in bot if to == number)
+
+
+def test_counts_are_shown_to_the_boss_the_way_staff_sent_them():
+    assert app_module._count_text(StockLevel("coconut", 1, "bottles")) == "1 bottle"
+    assert app_module._count_text(StockLevel("oat_milk", 1, "boxes")) == "1 box"
+    assert app_module._count_text(StockLevel("oat_milk", 2.5, "boxes")) == "2.5 boxes"
+    assert app_module._count_text(StockLevel("coconut", 0, "bottles")) == "0 bottles"
+    assert app_module._count_text(None) == "no count"
+
+
+def test_approval_request_states_the_real_deadline_in_the_cafes_time(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+
+    pending = storage.get_pending_approval()
+    deadline = pending.requested_at + timedelta(hours=24)
+    assert app_module._clock_text(deadline) in _to_boss(bot)[0]
+
+
+def test_yes_sends_the_supplier_the_order_the_boss_was_shown(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    # A count that lands after the boss was asked must not change what a yes releases.
+    storage.save_stock_report(STAFF[0], "later count", {"almond_milk": StockLevel("almond_milk", 0, "boxes")})
+    bot.clear()
+
+    reply = boss("Yes")
+
+    supplier_msgs = _to_supplier(bot)
+    assert len(supplier_msgs) == 1
+    assert "Almond * 4" in supplier_msgs[0] and "Soy * 4" in supplier_msgs[0]
+    assert "Sent to the supplier" in reply
+    for number in STAFF:
+        assert any("Stock ordered:" in body for to, body in bot if to == number)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_ORDERED
+    assert storage.get_order_history(1)[0]["items"]["almond_milk"] == 4
+    assert _approvals() == [("approved", "Yes")]
+    # What staff will have is worked out from the counts the order was made from: 8 + 4.
+    totals = _to_boss(bot, STAFF[0])[-1].split("Total Inventory until next Wednesday:")[1]
+    assert "Almond * 12" in totals
+
+
+def test_turning_down_an_order_asked_late_in_the_week_does_not_cancel_next_wednesdays(bot, boss, monkeypatch):
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=6))  # Tuesday: a manual trigger
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))  # answered on Wednesday morning
+    boss("no")
+
+    # The no closed the week the order was asked in, not the one that starts today.
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+
+
+@pytest.mark.parametrize("body", [
+    "yes", "Yes.", "YES!", "y", "yep", "yeah", "yup", "ok", "Okay", "ok thanks", "yes please",
+    "yep send it", "approve", "approved", "confirm", "send it", "Send", "go ahead", "sure", "\U0001F44D",
+])
+def test_replies_read_as_yes(body):
+    assert app_module._read_approval_reply(body) is True
+
+
+@pytest.mark.parametrize("body", [
+    "no", "No.", "n", "nope", "nah", "no thanks", "No, too much oat", "not ok", "not yet",
+    "don't send", "don’t send it", "stop", "cancel", "reject", "wrong", "\U0001F44E",
+    "no problem, send it",  # reads as a no: a wrong no costs a phone call, a wrong yes costs an order
+])
+def test_replies_read_as_no(body):
+    assert app_module._read_approval_reply(body) is False
+
+
+@pytest.mark.parametrize("body", [
+    "", "?", "what's this", "who is this", "yes but make the oat 4", "yes no", "ok wait",
+    "send me the count again", "I'll go check the fridge", "go check with Sam first",
+    "sure thing mate, what is it", "good morning", "do not send", "maybe", "8 almond 3 soy",
+])
+def test_replies_that_are_neither_are_not_guessed(body):
+    assert app_module._read_approval_reply(body) is None
+
+
+def test_an_unclear_reply_sends_nothing_and_the_order_stays_open(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    bot.clear()
+
+    reply = boss("who is this?")
+
+    assert "YES" in reply and "NO" in reply
+    assert bot == []
+    assert "Sent to the supplier" in boss("yes")
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_a_second_yes_does_not_send_a_second_order(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    boss("yes")
+    bot.clear()
+
+    reply = boss("yes")
+
+    assert bot == []
+    assert "Nothing was sent" in reply
+
+
+def test_a_yes_after_the_wait_is_over_sends_nothing_and_closes_the_week(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    _backdate_approvals(timedelta(hours=25))
+    bot.clear()
+
+    reply = boss("yes")
+
+    assert _to_supplier(bot) == []
+    assert "not sent" in reply and "by hand" in reply
+    for number in STAFF:
+        assert any("NOT been sent" in body and "by hand" in body for to, body in bot if to == number)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_NOT_APPROVED
+    # The week is over: neither another yes nor another run sends anything.
+    boss("yes")
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert _to_supplier(bot) == []
+
+
+def test_a_yes_from_a_staff_number_is_not_an_approval(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    bot.clear()
+
+    boss("yes", sender=STAFF[0])
+    boss("yes", sender="+61499999999")
+
+    assert bot == []
+    assert storage.get_pending_approval() is not None
+
+
+def test_a_no_sends_nothing_and_keeps_the_reason(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    bot.clear()
+
+    reply = boss("No, too much oat")
+
+    assert _to_supplier(bot) == []
+    assert "nothing was sent" in reply.lower()
+    assert _approvals() == [("rejected", "No, too much oat")]
+    # Changing their mind afterwards does not release the order that was turned down.
+    boss("yes")
+    assert _to_supplier(bot) == []
+
+
+def test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing(bot, boss):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    bot.clear()
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED  # a restart, the manual trigger
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_SKIPPED
+    assert bot == []
+    # The original request is still the one a yes releases.
+    boss("yes")
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_a_request_that_never_reached_the_boss_cannot_be_approved(bot, boss, monkeypatch):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    sent = bot
+
+    def send(to, body):
+        if to == BOSS:
+            raise RuntimeError("bad number")
+        sent.append((to, body))
+
+    monkeypatch.setattr(app_module, "send_sms", send)
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_FAILED
+    assert any("nothing was sent" in body for _, body in sent)  # staff know to order by hand
+    assert not any(STAFF_WAITING in body for _, body in sent)
+    sent.clear()
+    boss("yes")
+    assert _to_supplier(sent) == []
+
+
+def test_supplier_send_error_after_a_yes_is_unconfirmed_and_not_resent(bot, boss, monkeypatch):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    sent = bot
+    sent.clear()
+    attempts = []
+
+    def send(to, body):
+        if to == SUPPLIER:
+            attempts.append(body)
+            raise RuntimeError("read timeout")
+        sent.append((to, body))
+
+    monkeypatch.setattr(app_module, "send_sms", send)
+
+    reply = boss("yes")
+
+    assert "may not have reached" in reply
+    for number in STAFF:
+        assert any("may not have reached" in body for to, body in sent if to == number)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_SEND_UNCONFIRMED
+    boss("yes")
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert len(attempts) == 1
+
+
+def test_no_model_reads_the_bosses_reply(bot, boss, monkeypatch):
+    """Whether an order goes is decided by a fixed word list, never by a model."""
+    import anthropic
+
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    model_calls = []
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: model_calls.append("client") or 1 / 0)
+    monkeypatch.setattr(app_module, "parse_stock_sms", lambda body: model_calls.append(body) or 1 / 0)
+
+    boss("hmm, what do you think?")
+    boss("yep send it")
+
+    assert model_calls == []
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_a_boss_who_also_counts_stock_can_do_both(bot, sms, monkeypatch):
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", STAFF[0])
+
+    # Nothing waiting for approval: their text is a stock count like anyone else's.
+    assert "Stock updated" in sms("full count", LOW_STOCK, sender=STAFF[0])
+    assert storage.get_current_stock()["almond_milk"].quantity == 8
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+    client = app_module.app.test_client()
+    reply = client.post("/sms", data={"From": STAFF[0], "Body": "ok"}).get_data(as_text=True)
+    assert "Sent to the supplier" in reply
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_a_count_that_completes_the_wait_goes_to_the_boss_and_staff_are_told_so(bot, sms, boss):
+    app_module.run_weekly_order()  # no count: staff asked
+    bot.clear()
+
+    reply = sms("full count", LOW_STOCK)
+
+    assert "approval" in reply and "placing this week's order now" not in reply
+    assert _to_supplier(bot) == []
+    assert len(_to_boss(bot)) == 1
+
+
+def test_next_weeks_request_replaces_one_the_boss_never_answered(bot, boss, monkeypatch):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    _backdate_runs(timedelta(days=7))
+    _backdate_approvals(timedelta(days=7))
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    storage.save_stock_report(STAFF[0], "count", {**FULL_STOCK, "oat_milk": StockLevel("oat_milk", 6, "boxes")})
+    bot.clear()
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+    boss("yes")
+
+    supplier_msgs = _to_supplier(bot)
+    assert len(supplier_msgs) == 1
+    assert "Oat * 2" in supplier_msgs[0] and "Almond * 0" in supplier_msgs[0]
+    assert [status for status, _ in _approvals()] == ["superseded", "approved"]
+
+
+def test_with_no_approver_set_nothing_is_held(bot):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
+    assert len(_to_supplier(bot)) == 1
+    assert _approvals() == []

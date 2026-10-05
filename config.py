@@ -16,6 +16,10 @@ EMPLOYEE_PHONE_NUMBERS = [
     p.strip() for p in os.getenv("EMPLOYEE_PHONE_NUMBERS", "").split(",") if p.strip()
 ]
 
+# Who approves each order before it goes to the supplier, while the bot is on trial.
+# Set it and every order waits for their yes; leave it empty and orders go straight out.
+APPROVER_PHONE_NUMBER = os.getenv("APPROVER_PHONE_NUMBER", "").strip()
+
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -76,6 +80,10 @@ DELIVERY_DAYS = 2
 # How long an order waits for a missing stock count before the bot gives up and tells staff
 # to order by hand. Without an end, a count texted days later still released an order.
 WAIT_FOR_COUNT_HOURS = 24
+
+# How long an order waits for the approver's answer. After that it is not sent, whatever
+# they reply: a yes days later would release an order worked out from an old count.
+WAIT_FOR_APPROVAL_HOURS = 24
 
 # An order sent within this many days blocks another one, so a restart, a retry or the
 # manual trigger can't send the supplier the same order twice in one week.

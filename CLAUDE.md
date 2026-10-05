@@ -37,7 +37,16 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   follow-up ends the week (`closed_no_count`) and tells staff to order by hand, and a count only
   records stock. Without the end, a text days later released an order on top of the one staff had
   placed by hand. Every text that states a deadline must state the real one.
-- The only numbers the bot may text are `SUPPLIER_PHONE_NUMBER` and `EMPLOYEE_PHONE_NUMBERS`.
+- **On trial, the approver's yes is the only thing that sends an order.** While
+  `APPROVER_PHONE_NUMBER` is set, a run holds the order (`awaiting_approval`) and texts it to the
+  approver with the counts behind it. A yes sends the supplier the order they were shown, not one
+  re-worked from later counts. A no, or no answer in `WAIT_FOR_APPROVAL_HOURS` (24), sends nothing
+  and tells staff to order by hand. The reply is read by a fixed word list (`_read_approval_reply`),
+  never a model, and anything unclear is asked again. Remove the variable and orders go straight out.
+  Built so far: slice 1 of 3 (branch `feature/owner-approval`). Still to build: a no asks for a
+  recount, and the reminder and closing text when the approver stays silent.
+- The only numbers the bot may text are `SUPPLIER_PHONE_NUMBER`, `EMPLOYEE_PHONE_NUMBERS` and
+  `APPROVER_PHONE_NUMBER`.
 - Users: café staff on their phones. No screen, no login. Anything they need to do must work by SMS.
 
 ## Correctness traps
@@ -64,6 +73,13 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 | The process is restarting at 9:00 Wednesday and the week's run is dropped | `test_missed_run_is_detected_only_on_order_day_after_nine` |
 | Bottle items (lactose free, coconut) shown as boxes in the staff summary | `test_confirmation_totals_use_the_unit_staff_count_in` |
 | `/trigger` reachable with a key that is in the code | `test_trigger_is_off_without_a_configured_key` |
+| With approval on, an order reaches the supplier without a yes: straight from the run, from a re-run or forced run while one is waiting, or from a count that completes the wait | `test_with_approval_on_the_order_goes_to_the_boss_and_not_the_supplier`, `test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing`, `test_a_count_that_completes_the_wait_goes_to_the_boss_and_staff_are_told_so` |
+| A yes releases something other than what the approver saw (re-worked from a later count), or releases it twice | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order` |
+| A yes from the wrong person, a day late, or for a request that never reached the approver sends an order | `test_a_yes_from_a_staff_number_is_not_an_approval`, `test_a_yes_after_the_wait_is_over_sends_nothing_and_closes_the_week`, `test_a_request_that_never_reached_the_boss_cannot_be_approved`, `test_next_weeks_request_replaces_one_the_boss_never_answered` |
+| A reply that is not a clear yes is taken as one ("yes but make the oat 4", "send me the count again"), or a model is asked what the approver meant | `test_replies_read_as_yes`, `test_replies_read_as_no`, `test_replies_that_are_neither_are_not_guessed`, `test_an_unclear_reply_sends_nothing_and_the_order_stays_open`, `test_no_model_reads_the_bosses_reply` |
+| A no sends the order anyway, loses the approver's reason, or (answered after a new Wednesday has started) cancels that week's order | `test_a_no_sends_nothing_and_keeps_the_reason`, `test_turning_down_an_order_asked_late_in_the_week_does_not_cancel_next_wednesdays` |
+| The supplier send errors after a yes and the approver and staff are told it was sent, or it is sent again | `test_supplier_send_error_after_a_yes_is_unconfirmed_and_not_resent` |
+| An approver who also counts stock has their count swallowed as an unclear answer | `test_a_boss_who_also_counts_stock_can_do_both` |
 
 ## How to run, test and deploy (routines)
 - Run: `python app.py` (the scheduler only starts this way, not under gunicorn or `flask run`).

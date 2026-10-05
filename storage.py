@@ -4,7 +4,15 @@ import sqlite3
 from datetime import date, datetime, timezone
 
 from config import DB_PATH, STOCK_TARGETS
-from models import JobRun, OrderLine, StockLevel
+from models import Approval, JobRun, OrderLine, StockLevel
+
+# Where an order held for approval has got to — the status column of order_approvals.
+APPROVAL_PENDING = "pending"        # the approver has been asked; nothing sent
+APPROVAL_APPROVED = "approved"      # they said yes; the supplier send was attempted
+APPROVAL_REJECTED = "rejected"      # they said no
+APPROVAL_EXPIRED = "expired"        # no answer before the wait ended
+APPROVAL_SUPERSEDED = "superseded"  # still unanswered when a later order was held
+APPROVAL_CANCELLED = "cancelled"    # the request never reached the approver
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -45,6 +53,16 @@ def init_db() -> None:
                 outcome    TEXT NOT NULL,
                 detail     TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS order_approvals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_date   TEXT NOT NULL,
+                order_lines  TEXT NOT NULL,
+                counts       TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                reply        TEXT NOT NULL DEFAULT '',
+                requested_at TIMESTAMP NOT NULL,
+                decided_at   TIMESTAMP
             );
         """)
         conn.commit()
@@ -142,6 +160,72 @@ def get_last_run(outcomes: tuple[str, ...]) -> JobRun | None:
                 at=datetime.fromisoformat(row["created_at"]),
             )
         return None
+    finally:
+        conn.close()
+
+
+def save_approval_request(
+    order_date: date, order_lines: list[OrderLine], counts: dict[str, StockLevel]
+) -> Approval:
+    """Hold an order for the approver's answer. Stores the order as worked out now, so a yes
+    releases what they were shown and not whatever the counts say by then. Only one order
+    can be waiting: a request still open from before is superseded."""
+    now = datetime.now(timezone.utc)
+    lines_json = [{"item": ol.item, "label": ol.label, "quantity": ol.quantity} for ol in order_lines]
+    counts_json = {k: {"quantity": v.quantity, "unit": v.unit} for k, v in counts.items()}
+    conn = _get_connection()
+    try:
+        conn.execute(
+            "UPDATE order_approvals SET status = ?, decided_at = ? WHERE status = ?",
+            (APPROVAL_SUPERSEDED, now.isoformat(), APPROVAL_PENDING),
+        )
+        cursor = conn.execute(
+            "INSERT INTO order_approvals (order_date, order_lines, counts, status, requested_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (order_date.isoformat(), json.dumps(lines_json), json.dumps(counts_json), APPROVAL_PENDING, now.isoformat()),
+        )
+        conn.commit()
+        return Approval(
+            id=cursor.lastrowid, order_date=order_date, order_lines=order_lines, counts=counts, requested_at=now
+        )
+    finally:
+        conn.close()
+
+
+def get_pending_approval() -> Approval | None:
+    """The order waiting for the approver's answer, if there is one."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id, order_date, order_lines, counts, requested_at FROM order_approvals "
+            "WHERE status = ? ORDER BY id DESC LIMIT 1",
+            (APPROVAL_PENDING,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Approval(
+            id=row["id"],
+            order_date=date.fromisoformat(row["order_date"]),
+            order_lines=[OrderLine(**line) for line in json.loads(row["order_lines"])],
+            counts={k: StockLevel(k, v["quantity"], v["unit"]) for k, v in json.loads(row["counts"]).items()},
+            requested_at=datetime.fromisoformat(row["requested_at"]),
+        )
+    finally:
+        conn.close()
+
+
+def decide_approval(approval_id: int, status: str, reply: str = "") -> bool:
+    """Close a waiting approval with its outcome and the approver's own words. Returns False
+    if it was no longer waiting — the caller must then send nothing, because someone else
+    (a second yes, the closing job) got there first."""
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE order_approvals SET status = ?, reply = ?, decided_at = ? WHERE id = ? AND status = ?",
+            (status, reply, datetime.now(timezone.utc).isoformat(), approval_id, APPROVAL_PENDING),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
     finally:
         conn.close()
 

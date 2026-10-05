@@ -1,5 +1,6 @@
 import hmac
 import logging
+import re
 import threading
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -13,6 +14,8 @@ from twilio.twiml.messaging_response import MessagingResponse
 import storage
 from adjustments import get_total_adjustment
 from config import (
+    APPROVER_PHONE_NUMBER,
+    CAFE_NAME,
     DELIVERY_DAYS,
     EMPLOYEE_PHONE_NUMBERS,
     MIN_DAYS_BETWEEN_ORDERS,
@@ -21,9 +24,10 @@ from config import (
     STALE_THRESHOLD_DAYS,
     SUPPLIER_PHONE_NUMBER,
     TRIGGER_KEY,
+    WAIT_FOR_APPROVAL_HOURS,
 )
-from models import JobRun, OrderLine, StockLevel
-from order_calculator import calculate_order, format_order_message
+from models import Approval, JobRun, OrderLine, StockLevel
+from order_calculator import calculate_order, format_order_lines, format_order_message
 from sms import send_sms, validate_twilio_request
 from stock_parser import format_confirmation, parse_stock_sms
 
@@ -46,6 +50,10 @@ OUTCOME_SEND_UNCONFIRMED = "send_unconfirmed"
 OUTCOME_RECENT_ORDER = "recent_order"
 # The order waited a day for a stock count that never came: staff told to order by hand.
 OUTCOME_CLOSED = "closed_no_count"
+# The order is worked out and with the approver. Nothing has gone to the supplier.
+OUTCOME_AWAITING_APPROVAL = "awaiting_approval"
+# The approver said no, or did not answer in time: nothing sent, staff told to order by hand.
+OUTCOME_NOT_APPROVED = "closed_not_approved"
 ALL_OUTCOMES = (
     OUTCOME_ORDERED,
     OUTCOME_NO_ORDER_NEEDED,
@@ -55,6 +63,8 @@ ALL_OUTCOMES = (
     OUTCOME_SEND_UNCONFIRMED,
     OUTCOME_RECENT_ORDER,
     OUTCOME_CLOSED,
+    OUTCOME_AWAITING_APPROVAL,
+    OUTCOME_NOT_APPROVED,
 )
 # Outcomes after which the job must not order again in the same week without force.
 HANDLED_OUTCOMES = (
@@ -63,6 +73,8 @@ HANDLED_OUTCOMES = (
     OUTCOME_SEND_UNCONFIRMED,
     OUTCOME_RECENT_ORDER,
     OUTCOME_CLOSED,
+    OUTCOME_AWAITING_APPROVAL,
+    OUTCOME_NOT_APPROVED,
 )
 # The 1pm reminder for a count the order is waiting on. Logged, but deliberately not in
 # ALL_OUTCOMES: it is not a run of the order job, and the week must still read as waiting.
@@ -72,6 +84,7 @@ ORDER_WEEKDAY = 2  # Wednesday (Monday is 0) — matches the scheduler below
 FORCE_COOLDOWN = timedelta(minutes=10)
 DELIVERY_TIME = timedelta(days=DELIVERY_DAYS)
 WAIT_FOR_COUNT = timedelta(hours=WAIT_FOR_COUNT_HOURS)
+WAIT_FOR_APPROVAL = timedelta(hours=WAIT_FOR_APPROVAL_HOURS)
 REMIND_AFTER = timedelta(hours=4)  # one reminder, this long after a count is asked for
 COUNT_FORMAT = "Almond: X, Oat: X, Soy: X, LF: X bottles, Coconut: X bottles"
 
@@ -107,6 +120,15 @@ def incoming_sms():
 
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
+
+    # The approver's yes or no to an order that is waiting. Read before the staff path,
+    # and never by the model: only a stock count goes to parse_stock_sms.
+    if APPROVER_PHONE_NUMBER and from_number == APPROVER_PHONE_NUMBER:
+        answer = _answer_from_approver(body)
+        if answer is not None:
+            resp = MessagingResponse()
+            resp.message(answer)
+            return str(resp)
 
     # Check employee allowlist
     if from_number not in EMPLOYEE_PHONE_NUMBERS:
@@ -146,7 +168,10 @@ def incoming_sms():
             )
         elif still_needed is not None:
             threading.Thread(target=run_weekly_order, daemon=True).start()
-            confirmation += "\nThat completes the count — placing this week's order now."
+            if APPROVER_PHONE_NUMBER:
+                confirmation += "\nThat completes the count. This week's order is going for approval now."
+            else:
+                confirmation += "\nThat completes the count — placing this week's order now."
     except Exception:
         logger.exception("Could not check whether the order job is waiting on this count")
 
@@ -379,6 +404,11 @@ def _place_order(today: date, force: bool) -> tuple[str, str]:
     if not force and handled:
         logger.warning("This week's order was already handled — not sending again")
         return OUTCOME_SKIPPED, "already handled this week"
+    if force and APPROVER_PHONE_NUMBER and storage.get_pending_approval():
+        # The approver already has this week's order. A second request would leave two
+        # orders a yes could mean, and a forced run must not go around their answer.
+        logger.warning("Forced run refused — an order is waiting for approval")
+        return OUTCOME_SKIPPED, "forced run refused: an order is waiting for approval"
     if force:
         # force is for a deliberate re-send, not for a double-click or a browser retry.
         last_sent = storage.get_last_run((OUTCOME_ORDERED,))
@@ -449,6 +479,11 @@ def _place_order(today: date, force: bool) -> tuple[str, str]:
         _notify_employees("Stock levels are good — no order needed this week.")
         return OUTCOME_NO_ORDER_NEEDED, detail
 
+    if APPROVER_PHONE_NUMBER:
+        # On trial: the order goes to the approver, and only their yes sends it on.
+        _ask_for_approval(today, order_lines, current_stock)
+        return OUTCOME_AWAITING_APPROVAL, "awaiting approval: " + detail.removeprefix("sent: ")
+
     # Format and send order to supplier
     adjustment = get_total_adjustment(today)
     order_message = format_order_message(order_lines, today, adjustment)
@@ -459,7 +494,15 @@ def _place_order(today: date, force: bool) -> tuple[str, str]:
         raise SupplierSendUnconfirmed(detail) from e
     logger.info("Order sent to supplier: %s", order_message)
 
-    # The order is out. Nothing below may raise, or the caller would tell staff it wasn't sent.
+    _record_sent_order(today, order_lines, current_stock)
+    return OUTCOME_ORDERED, detail
+
+
+def _record_sent_order(
+    today: date, order_lines: list[OrderLine], current_stock: dict[str, StockLevel]
+) -> None:
+    """After the supplier has the order: save it and tell staff. Nothing here may raise,
+    or the caller would report an order that went out as one that did not."""
     try:
         storage.save_order(today, order_lines)
     except Exception:
@@ -469,13 +512,202 @@ def _place_order(today: date, force: bool) -> tuple[str, str]:
     except Exception:
         logger.exception("Order was sent but the staff confirmation could not be built")
 
-    return OUTCOME_ORDERED, detail
+
+def _clock_text(moment: datetime) -> str:
+    """A moment in the cafe's time, as staff would say it: e.g. '9:00am Thursday'."""
+    local = moment.astimezone(MELBOURNE_TZ)
+    return f"{local.hour % 12 or 12}:{local.minute:02d}{'am' if local.hour < 12 else 'pm'} {local:%A}"
+
+
+def _count_text(level: StockLevel | None) -> str:
+    """A stock count as staff sent it: '8 boxes', '1 bottle'."""
+    if level is None:
+        return "no count"
+    unit = {"boxes": "box", "bottles": "bottle"}[level.unit] if level.quantity == 1 else level.unit
+    return f"{level.quantity:g} {unit}"
+
+
+def build_approval_request(approval: Approval) -> str:
+    """The text the approver answers: the order as the supplier would get it, the counts it
+    was worked out from (a misread count is the mistake they can catch), and the deadline."""
+    counted = ", ".join(
+        f"{target['label'].replace(' Milk', '')} {_count_text(approval.counts.get(item_key))}"
+        for item_key, target in STOCK_TARGETS.items()
+    )
+    return "\n".join([
+        f"{CAFE_NAME} milk order for approval:",
+        "",
+        *format_order_lines(approval.order_lines),
+        "",
+        f"Counted: {counted}",
+        "",
+        "Reply YES to send it to the supplier, or NO to stop it.",
+        f"If there's no reply by {_clock_text(approval.requested_at + WAIT_FOR_APPROVAL)}, it won't be sent.",
+    ])
+
+
+def _ask_for_approval(
+    today: date, order_lines: list[OrderLine], current_stock: dict[str, StockLevel]
+) -> None:
+    """Hold the order and text it to the approver. Nothing goes to the supplier here."""
+    approval = storage.save_approval_request(today, order_lines, current_stock)
+    try:
+        send_sms(APPROVER_PHONE_NUMBER, build_approval_request(approval))
+    except Exception:
+        # The approver may never have seen it, so no reply may release it. The run then
+        # fails the ordinary way: staff are told nothing was sent and to order by hand.
+        storage.decide_approval(approval.id, storage.APPROVAL_CANCELLED)
+        raise
+    logger.info("Order held for approval (request %s)", approval.id)
+    _notify_employees(
+        "This week's milk order is worked out and waiting for approval before it goes to "
+        "the supplier. You'll get a text when it's sent."
+    )
+
+
+# How the approver's reply is read. A fixed list, not a model: whether an order goes must
+# not rest on a guess. Anything the list does not settle is asked again.
+_YES_OPENERS = {"yes", "y", "yep", "yeah", "yup", "ya", "ok", "okay", "approve", "approved", "confirm", "confirmed"}
+# Looser ways to say yes count only when they are the whole reply: "send it" is a yes,
+# "send me the count again" is not.
+_YES_WHOLE_REPLIES = {"send", "send it", "go", "go ahead", "sure", "do it", "k"}
+_NO_OPENERS = {"no", "n", "nope", "nah", "not", "dont", "stop", "cancel", "reject", "rejected", "wrong"}
+# A yes followed by any of these is not a plain yes ("yes but make the oat 4").
+_DOUBT_WORDS = _NO_OPENERS | {"but", "wait", "hold", "except", "change", "instead", "unless", "if"}
+_THUMBS_UP, _THUMBS_DOWN = "\U0001F44D", "\U0001F44E"
+
+
+def _read_approval_reply(body: str) -> bool | None:
+    """True for a yes, False for a no, None when it is neither or it is unclear. Leans
+    towards no: a wrong no costs a phone call, a wrong yes costs an order."""
+    text = body.strip().lower().replace("'", "").replace("\u2019", "")
+    words = re.findall(r"[a-z]+", text)
+    if not words:
+        if text.startswith(_THUMBS_UP):
+            return True
+        return False if text.startswith(_THUMBS_DOWN) else None
+    if words[0] in _NO_OPENERS:
+        return False
+    if " ".join(words) in _YES_WHOLE_REPLIES:
+        return True
+    if words[0] in _YES_OPENERS and not _DOUBT_WORDS.intersection(words[1:]):
+        return True
+    return None
+
+
+NOTHING_WAITING = "There's no milk order waiting for approval. Nothing was sent just now."
+
+
+def _answer_from_approver(body: str) -> str | None:
+    """Deal with a text from the approver and return the reply to send them. Returns None
+    when the text is not an answer to anything — an approver who also counts stock, texting
+    a count while no order is waiting — so the caller reads it as a staff text."""
+    decision = _read_approval_reply(body)
+    # Under the order lock: the weekly run, a second yes and the approver's answer can
+    # overlap, and only one of them may act on the waiting order.
+    with _order_lock:
+        approval = storage.get_pending_approval()
+        if approval is None:
+            if decision is None and APPROVER_PHONE_NUMBER in EMPLOYEE_PHONE_NUMBERS:
+                return None
+            return NOTHING_WAITING
+        if datetime.now(timezone.utc) - approval.requested_at >= WAIT_FOR_APPROVAL:
+            # The wait is over even if the closing text never ran (process down at the time).
+            return _close_unanswered(approval)
+        if decision is None:
+            return "Reply YES to send this week's milk order to the supplier, or NO to stop it."
+        if decision:
+            return _send_approved_order(approval, body)
+        return _turn_down_order(approval, body)
+
+
+def _log_run(today: date, outcome: str, detail: str) -> None:
+    try:
+        storage.log_run(today, outcome, detail)
+    except Exception:
+        logger.exception("Could not write the run log (outcome: %s)", outcome)
+
+
+def _send_approved_order(approval: Approval, reply: str) -> str:
+    """The approver said yes: send the supplier the order they were shown. Runs inside the
+    webhook request rather than a thread, so the reply can say what actually happened."""
+    today = _melbourne_today()
+    detail = "approved; sent: " + ", ".join(f"{ol.item}={ol.quantity}" for ol in approval.order_lines)
+    try:
+        order_message = format_order_message(approval.order_lines, today, get_total_adjustment(today))
+        # Claimed before the send: a second yes finds nothing waiting and sends nothing.
+        if not storage.decide_approval(approval.id, storage.APPROVAL_APPROVED, reply):
+            return NOTHING_WAITING
+    except Exception:
+        logger.exception("The approved order could not be prepared — nothing was sent")
+        return (
+            "Something went wrong and the order was NOT sent to the supplier. "
+            "Reply YES to try again, or place the order by hand."
+        )
+
+    try:
+        send_sms(SUPPLIER_PHONE_NUMBER, order_message)
+    except Exception as e:
+        # As in _run_once: the send raised, which does not prove the supplier got nothing.
+        logger.exception("Supplier SMS could not be confirmed")
+        _log_run(today, OUTCOME_SEND_UNCONFIRMED, repr(e))
+        _notify_employees(
+            "The automatic milk order may not have reached the supplier. "
+            "Please check with them before ordering again."
+        )
+        return "The order may not have reached the supplier. Please check with them before ordering again."
+    logger.info("Order sent to supplier after approval: %s", order_message)
+
+    _record_sent_order(today, approval.order_lines, approval.counts)
+    _log_run(today, OUTCOME_ORDERED, detail)
+    return "Sent to the supplier. Staff have been told."
+
+
+def _turn_down_order(approval: Approval, reply: str) -> str:
+    """The approver said no: nothing goes to the supplier and the week is closed. Their
+    words are kept with the approval — the only record of why an order was turned down."""
+    if not storage.decide_approval(approval.id, storage.APPROVAL_REJECTED, reply):
+        return NOTHING_WAITING
+    logger.warning("The approver turned down this week's order — nothing sent")
+    reached = _notify_employees(
+        "This week's milk order was not approved, so it has NOT been sent to the supplier. "
+        "Please order by hand. The next automatic order is next Wednesday."
+    )
+    # Dated to the day the approver was asked: this closes that order's week, and must
+    # not count against a Wednesday that has started since.
+    _log_run(
+        approval.order_date,
+        OUTCOME_NOT_APPROVED,
+        f"approver said no; told {reached} of {len(EMPLOYEE_PHONE_NUMBERS)} staff",
+    )
+    return "OK, nothing was sent to the supplier. Staff have been told to order by hand."
+
+
+def _close_unanswered(approval: Approval) -> str:
+    """The wait for an answer is over: nothing goes to the supplier, whatever comes now."""
+    if not storage.decide_approval(approval.id, storage.APPROVAL_EXPIRED):
+        return NOTHING_WAITING
+    logger.warning("No answer from the approver in time — this week's order was not sent")
+    reached = _notify_employees(
+        "This week's milk order was not approved in time, so it has NOT been sent to the "
+        "supplier. Please order by hand. The next automatic order is next Wednesday."
+    )
+    # Dated to the day the approver was asked: this closes that order's week, and must
+    # not count against a Wednesday that has started since.
+    _log_run(
+        approval.order_date,
+        OUTCOME_NOT_APPROVED,
+        f"no answer from the approver; told {reached} of {len(EMPLOYEE_PHONE_NUMBERS)} staff",
+    )
+    return (
+        "That order was not approved in time, so it was not sent to the supplier. "
+        "Please place this week's order by hand."
+    )
 
 
 def _deadline_text(request: JobRun) -> str:
     """When the wait for a count ends, in the cafe's time: e.g. '9:00am Thursday'."""
-    ends = (request.at + WAIT_FOR_COUNT).astimezone(MELBOURNE_TZ)
-    return f"{ends.hour % 12 or 12}:{ends.minute:02d}{'am' if ends.hour < 12 else 'pm'} {ends:%A}"
+    return _clock_text(request.at + WAIT_FOR_COUNT)
 
 
 def chase_missing_count(final: bool = False) -> list[str]:

@@ -68,15 +68,15 @@ def format_order_message(
     adjustment: float,
 ) -> str:
     """Format order lines into an SMS-friendly message for the supplier."""
-    from config import STOCK_TARGETS
-
     date_str = f"{order_date.day}/{order_date.month}/{str(order_date.year)[2:]}"
-    order_by_item = {ol.item: ol.quantity for ol in order_lines}
+    return "\n".join(["Hey Brent,", "", date_str, "", *format_order_lines(order_lines)])
 
-    lines = ["Hey Brent,", "", date_str, ""]
+
+def format_order_lines(order_lines: list[OrderLine]) -> list[str]:
+    """One line per item the cafe stocks, zero included, as the supplier reads them."""
+    order_by_item = {ol.item: ol.quantity for ol in order_lines}
+    lines = []
     for item_key, target in STOCK_TARGETS.items():
         short_label = target["label"].replace(" Milk", "")
-        qty = order_by_item.get(item_key, 0)
-        lines.append(f"{short_label} * {qty}")
-
-    return "\n".join(lines)
+        lines.append(f"{short_label} * {order_by_item.get(item_key, 0)}")
+    return lines
