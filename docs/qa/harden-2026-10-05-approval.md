@@ -29,7 +29,7 @@ these branches publishes them. Make the repo private first, or decide that is fi
 
 | # | What goes wrong for the café | Status |
 |---|---|---|
-| 1 | **A reply that was not a plain yes sent the order.** "Ok I'll check the fridge first", "yes make the oat 4", "ok?", "ok 🤔", "ok нет" and "ok . . ." each reached the supplier at some point in the build. | **Fixed.** A yes must be the whole message: a yes-word, then only listed phrases, written only with letters, spaces, `.` `,` `!` and a yes emoji. Found by the `qa` agent over three reviews; 77 of its replies are now tests. |
+| 1 | **A reply that was not a plain yes sent the order.** "Ok I'll check the fridge first", "yes make the oat 4", "ok?", "ok 🤔", "ok нет" and "ok . . ." each reached the supplier at some point in the build. | **Fixed.** A yes must be the whole message: a yes-word, then only listed phrases, written only with letters, spaces, `.` `,` `!` and a yes emoji. Found by the `qa` agent over three reviews; the replies it reported are now in the tests. |
 | 2 | **The approval step has never sent or received a real text.** Everything above is proven with fake SMS. | **Open. Not a code fix.** The Twilio account needs a number, then the real run: request arrives on a phone, a yes sends the order. |
 | 3 | **A redeploy can lose an order that is waiting for approval, with nobody told**, if `data/` is not on a persistent Railway volume. The waiting order, its follow-ups and the record of the week all live in `data/stock.db`. | **Open. Not a code fix.** Same root as finding 2 of the earlier pass; the volume is still unchecked. |
 | 4 | **Removing the approver's number while an order waited left it stranded**, and a follow-up could later tell staff nothing was sent after a forced run had sent it. | **Fixed.** Cancelled at startup, staff told to order by hand. Remove the variable when nothing is waiting. |
@@ -56,7 +56,7 @@ All at unit level, with fake SMS. Command: `python -m pytest -q` → `264 passed
 | Count in → order held → approver says yes → supplier gets that order once | PASS | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order`, `test_simultaneous_yeses_send_one_order` |
 | Approver says no → staff recount → new order back to the approver → yes sends it | PASS | `test_a_recount_after_a_no_goes_back_to_the_boss_and_their_yes_sends_it`, `test_the_count_the_boss_turned_down_is_not_used_again` |
 | Approver says nothing → one reminder → week closed, everyone told | PASS | `test_a_silent_boss_gets_one_reminder_with_the_order_in_it`, `test_no_answer_in_a_day_closes_the_week_and_tells_the_boss_and_staff` |
-| A reply that is not a plain yes or no sends nothing | PASS | `test_replies_that_are_neither_are_not_guessed` (83 replies), `test_no_model_reads_the_bosses_reply` |
+| A reply that is not a plain yes or no sends nothing | PASS | `test_replies_that_are_neither_are_not_guessed` (77 replies), `test_no_model_reads_the_bosses_reply` |
 | Process restarts part-way through any of the above | PASS | the five `test_startup_…` tests |
 | Approval switched off → the bot behaves as it did before | PASS | the 73 earlier tests, unchanged, plus `test_with_no_approver_set_nothing_is_held` |
 | A real text to a real phone and back | **NOT RUN** | Twilio account has no number |
