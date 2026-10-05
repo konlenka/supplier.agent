@@ -929,15 +929,16 @@ def test_yes_sends_the_supplier_the_order_the_boss_was_shown(bot, boss):
     assert "Almond * 12" in totals
 
 
-def test_turning_down_an_order_asked_late_in_the_week_does_not_cancel_next_wednesdays(bot, boss, monkeypatch):
+def test_an_order_asked_late_in_the_week_and_never_answered_does_not_cancel_next_wednesdays(bot, boss, monkeypatch):
     _set_today(monkeypatch, WEDNESDAY + timedelta(days=6))  # Tuesday: a manual trigger
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
     assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
 
-    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))  # answered on Wednesday morning
-    boss("no")
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))  # the wait ends on Wednesday
+    _backdate_approvals(timedelta(hours=25))
+    boss("yes")
 
-    # The no closed the week the order was asked in, not the one that starts today.
+    # That closed the week the order was asked in, not the one that starts today.
     assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
 
 
@@ -1023,19 +1024,300 @@ def test_a_yes_from_a_staff_number_is_not_an_approval(bot, boss):
     assert storage.get_pending_approval() is not None
 
 
-def test_a_no_sends_nothing_and_keeps_the_reason(bot, boss):
+RECOUNT = {**FULL_STOCK, "oat_milk": StockLevel("oat_milk", 6, "boxes")}  # oat 2 boxes short
+
+
+def _held_order_turned_down(bot, boss, reply="No, too much oat"):
+    """A week where the order went to the boss and they said no. Returns the bot's answer."""
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
     app_module.run_weekly_order()
     bot.clear()
+    return boss(reply)
 
-    reply = boss("No, too much oat")
+
+def test_a_no_sends_nothing_keeps_the_reason_and_asks_staff_to_count_again(bot, boss):
+    reply = _held_order_turned_down(bot, boss)
 
     assert _to_supplier(bot) == []
-    assert "nothing was sent" in reply.lower()
+    assert "nothing was sent" in reply.lower() and "count again" in reply
     assert _approvals() == [("rejected", "No, too much oat")]
+    for number in STAFF:
+        asked = [body for to, body in bot if to == number]
+        assert len(asked) == 1
+        assert "not approved" in asked[0] and "count" in asked[0] and "again" in asked[0]
+        assert "within 24 hours" in asked[0] and "by hand" in asked[0]
     # Changing their mind afterwards does not release the order that was turned down.
     boss("yes")
     assert _to_supplier(bot) == []
+
+
+def test_the_count_the_boss_turned_down_is_not_used_again(bot, boss):
+    _held_order_turned_down(bot, boss)
+    bot.clear()
+
+    assert set(app_module._still_needed(WEDNESDAY)) == {
+        "Almond Milk", "Oat Milk", "Soy Milk", "Lactose Free", "Coconut"
+    }
+    # A restart or the manual trigger must not put the same order in front of the boss again.
+    assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
+    assert _to_boss(bot) == [] and _to_supplier(bot) == []
+    assert "not approved" in bot[0][1] and "count the milk again" in bot[0][1]  # and staff are told why
+    # Nor may a forced run: force re-sends an order, it does not overrule the boss's no.
+    _backdate_runs(timedelta(minutes=30))
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_STALE
+    assert _to_boss(bot) == [] and _to_supplier(bot) == []
+
+
+def test_the_reminder_after_a_no_chases_the_recount_and_does_not_release_the_old_count(bot, boss):
+    _held_order_turned_down(bot, boss)
+    _backdate_runs(timedelta(hours=5))
+    bot.clear()
+
+    still_missing = app_module.chase_missing_count()
+
+    assert len(still_missing) == 5
+    assert _to_boss(bot) == [] and _to_supplier(bot) == []
+    assert all(body.startswith("Reminder") and "for approval" in body for _, body in bot)
+    assert len(bot) == len(STAFF)
+
+
+def test_a_recount_after_a_no_goes_back_to_the_boss_and_their_yes_sends_it(bot, sms, boss):
+    _held_order_turned_down(bot, boss)
+    bot.clear()
+
+    reply = sms("almond 12", {"almond_milk": FULL_STOCK["almond_milk"]})
+    assert "Still need a count for" in reply and "Oat Milk" in reply
+    assert _to_boss(bot) == []  # a part count releases nothing
+
+    reply = sms("recount", RECOUNT)
+    assert "approval" in reply
+    assert _to_supplier(bot) == []
+    second_request = _to_boss(bot)
+    assert len(second_request) == 1
+    assert "Oat * 2" in second_request[0] and "Almond * 0" in second_request[0]
+
+    assert "Sent to the supplier" in boss("ok")
+    supplier_msgs = _to_supplier(bot)
+    assert len(supplier_msgs) == 1 and "Oat * 2" in supplier_msgs[0] and "Almond * 0" in supplier_msgs[0]
+    assert [status for status, _ in _approvals()] == ["rejected", "approved"]
+
+
+def test_a_second_no_asks_for_another_recount(bot, sms, boss):
+    _held_order_turned_down(bot, boss)
+    sms("recount", RECOUNT)
+    bot.clear()
+
+    boss("no")
+
+    assert _to_supplier(bot) == []
+    assert all("count" in body and "again" in body for _, body in bot) and len(bot) == len(STAFF)
+    assert [status for status, _ in _approvals()] == ["rejected", "rejected"]
+    # And the recount that follows is asked of the boss a third time.
+    bot.clear()
+    sms("third count", RECOUNT)
+    assert len(_to_boss(bot)) == 1
+
+
+def test_no_recount_within_a_day_closes_the_week(bot, sms, boss):
+    _held_order_turned_down(bot, boss)
+    _backdate_runs(timedelta(hours=25))
+    bot.clear()
+
+    app_module.chase_missing_count(final=True)
+
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_CLOSED
+    assert all("by hand" in body for _, body in bot) and len(bot) == len(STAFF)
+    bot.clear()
+    assert "Stock updated" in sms("late recount", RECOUNT)  # only records stock now
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert bot == []
+
+
+def test_a_no_books_the_reminder_and_closing_text_for_the_recount(bot, boss):
+    _clear_follow_up_jobs()
+    _held_order_turned_down(bot, boss)
+
+    request = app_module._open_request(WEDNESDAY)
+    jobs = _follow_up_jobs()
+    assert jobs["chase_count"].trigger.run_date == request.at + timedelta(hours=4)
+    assert jobs["chase_count_final"].trigger.run_date == request.at + timedelta(hours=24)
+
+
+def test_staff_are_told_the_order_goes_for_approval_not_straight_out(bot, boss):
+    app_module.run_weekly_order()  # no count: staff asked
+    assert "will go for approval as soon as the count is in" in bot[0][1]
+    bot.clear()
+
+    _backdate_runs(timedelta(hours=5))
+    app_module.chase_missing_count()
+    assert "goes for approval as soon as the count is in" in bot[0][1]
+
+
+def test_without_approval_staff_are_told_the_order_goes_out(bot):
+    app_module.run_weekly_order()
+    assert "the order will go out as soon as the count is in" in bot[0][1]
+    bot.clear()
+
+    _backdate_runs(timedelta(hours=5))
+    app_module.chase_missing_count()
+    assert "it goes as soon as the count is in" in bot[0][1]
+
+
+# --- The boss does not answer ---
+
+def _approval_jobs():
+    return {job.id: job for job in app_module.scheduler.get_jobs() if job.id.startswith("chase_approval")}
+
+
+def _clear_approval_jobs():
+    while _approval_jobs():
+        for job_id in _approval_jobs():
+            app_module.scheduler.remove_job(job_id)
+
+
+def _order_waiting_for_the_boss(bot):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
+    bot.clear()
+    return storage.get_pending_approval()
+
+
+def test_asking_the_boss_books_a_reminder_and_a_closing_text(bot, boss):
+    _clear_approval_jobs()
+    pending = _order_waiting_for_the_boss(bot)
+    jobs = _approval_jobs()
+
+    assert jobs["chase_approval"].trigger.run_date == pending.requested_at + timedelta(hours=4)
+    assert jobs["chase_approval_final"].trigger.run_date == pending.requested_at + timedelta(hours=24)
+    assert jobs["chase_approval"].kwargs == {}
+    assert jobs["chase_approval_final"].kwargs == {"final": True}
+    assert jobs["chase_approval_final"].misfire_grace_time is None  # late is fine, never dropped
+
+
+def test_nothing_is_booked_for_the_boss_when_approval_is_off(bot):
+    _clear_approval_jobs()
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    assert _approval_jobs() == {}
+
+
+def test_a_silent_boss_gets_one_reminder_with_the_order_in_it(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+
+    app_module.chase_approval()
+    app_module.chase_approval()  # a re-run of the job must not text twice
+
+    assert _to_supplier(bot) == []
+    reminders = _to_boss(bot)
+    assert len(reminders) == 1 and len(bot) == 1
+    assert reminders[0].startswith("Reminder")
+    assert "Almond * 4" in reminders[0] and "YES" in reminders[0]
+    assert app_module._clock_text(pending.requested_at + timedelta(hours=24)) in reminders[0]
+    # The order is still theirs to approve.
+    assert "Sent to the supplier" in boss("yes")
+
+
+def test_no_answer_in_a_day_closes_the_week_and_tells_the_boss_and_staff(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    _backdate_approvals(timedelta(hours=24, minutes=1))
+
+    app_module.chase_approval(final=True)
+
+    assert _to_supplier(bot) == []
+    assert any("not sent" in body and "by hand" in body for body in _to_boss(bot))
+    for number in STAFF:
+        assert any("NOT been sent" in body and "by hand" in body for to, body in bot if to == number)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_NOT_APPROVED
+    assert [status for status, _ in _approvals()] == ["expired"]
+    bot.clear()
+    boss("yes")
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert _to_supplier(bot) == []
+
+
+def test_a_boss_who_is_also_staff_is_told_once_when_the_week_closes(bot, sms, monkeypatch):
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", STAFF[0])
+    _order_waiting_for_the_boss(bot)
+    _backdate_approvals(timedelta(hours=25))
+
+    app_module.chase_approval(final=True)
+
+    assert len([body for to, body in bot if to == STAFF[0]]) == 1
+    assert len(bot) == len(STAFF)
+
+
+def test_the_boss_is_not_chased_once_they_have_answered(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    boss("yes")
+    bot.clear()
+
+    app_module.chase_approval()
+    _backdate_approvals(timedelta(hours=25))
+    app_module.chase_approval(final=True)
+
+    assert bot == []
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_ORDERED
+
+
+def test_a_reminder_that_runs_after_the_deadline_does_not_nag(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    _backdate_approvals(timedelta(hours=25))
+
+    app_module.chase_approval()
+
+    assert bot == []
+
+
+def test_a_closing_job_left_from_an_earlier_request_does_not_close_a_new_one(bot, boss):
+    _order_waiting_for_the_boss(bot)  # asked moments ago
+    _clear_approval_jobs()
+
+    app_module.chase_approval(final=True)  # booked for a request that has since been replaced
+
+    assert bot == []
+    assert storage.get_pending_approval() is not None
+    assert "chase_approval_final" in _approval_jobs()  # and this request keeps its own closing text
+
+
+def test_a_restart_rebooks_the_follow_ups_for_an_order_still_with_the_boss(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    _clear_approval_jobs()  # the jobs lived in memory; the process restarted
+    _backdate_approvals(timedelta(hours=30))  # and stayed down past the reminder and the deadline
+
+    app_module._schedule_approval_follow_ups()
+    jobs = _approval_jobs()
+
+    assert "chase_approval" not in jobs  # too late to remind
+    due_in = jobs["chase_approval_final"].trigger.run_date - datetime.now(timezone.utc)
+    assert timedelta(0) < due_in <= timedelta(minutes=1)  # the closing text still goes, now
+
+
+def test_a_yes_cut_off_before_the_send_was_recorded_is_reported_not_assumed(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+    # The process died after the yes was taken and before the send to the supplier was
+    # logged: it is unknown whether the supplier has the order.
+    storage.decide_approval(pending.id, storage.APPROVAL_APPROVED, "yes")
+
+    app_module._recover_interrupted_send()
+    app_module._recover_interrupted_send()  # every restart runs this; it must report once
+
+    assert _to_supplier(bot) == []  # never re-sent on its own
+    assert len(_to_boss(bot)) == 1 and "may not have reached" in _to_boss(bot)[0]
+    for number in STAFF:
+        assert [body for to, body in bot if to == number and "may not have reached" in body] != []
+    assert len(bot) == 1 + len(STAFF)
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_SEND_UNCONFIRMED
+
+
+def test_a_yes_that_was_sent_and_recorded_is_left_alone_after_a_restart(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    boss("yes")
+    bot.clear()
+
+    app_module._recover_interrupted_send()
+
+    assert bot == []
+    assert storage.get_last_run(app_module.ALL_OUTCOMES).outcome == app_module.OUTCOME_ORDERED
 
 
 def test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing(bot, boss):

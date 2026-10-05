@@ -62,6 +62,7 @@ def init_db() -> None:
                 status       TEXT NOT NULL,
                 reply        TEXT NOT NULL DEFAULT '',
                 requested_at TIMESTAMP NOT NULL,
+                reminded_at  TIMESTAMP,
                 decided_at   TIMESTAMP
             );
         """)
@@ -226,6 +227,34 @@ def decide_approval(approval_id: int, status: str, reply: str = "") -> bool:
         )
         conn.commit()
         return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def mark_approval_reminded(approval_id: int) -> bool:
+    """Record that the approver was reminded about a waiting order. Returns False if they
+    already were, or it is no longer waiting — the caller then sends no reminder."""
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE order_approvals SET reminded_at = ? WHERE id = ? AND status = ? AND reminded_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), approval_id, APPROVAL_PENDING),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def get_last_decision_time(status: str) -> datetime | None:
+    """When the most recent approval with this status was decided."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT decided_at FROM order_approvals WHERE status = ? ORDER BY id DESC LIMIT 1",
+            (status,),
+        ).fetchone()
+        return datetime.fromisoformat(row["decided_at"]) if row else None
     finally:
         conn.close()
 

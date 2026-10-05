@@ -40,11 +40,15 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 - **On trial, the approver's yes is the only thing that sends an order.** While
   `APPROVER_PHONE_NUMBER` is set, a run holds the order (`awaiting_approval`) and texts it to the
   approver with the counts behind it. A yes sends the supplier the order they were shown, not one
-  re-worked from later counts. A no, or no answer in `WAIT_FOR_APPROVAL_HOURS` (24), sends nothing
-  and tells staff to order by hand. The reply is read by a fixed word list (`_read_approval_reply`),
+  re-worked from later counts. The reply is read by a fixed word list (`_read_approval_reply`),
   never a model, and anything unclear is asked again. Remove the variable and orders go straight out.
-  Built so far: slice 1 of 3 (branch `feature/owner-approval`). Still to build: a no asks for a
-  recount, and the reminder and closing text when the approver stays silent.
+- **A no means count again, every time.** Staff are asked for a recount and only a count taken
+  after the no can be ordered from (`_usable_from`); the new order goes back to the approver. There
+  is no limit on the number of recounts (Christian's call, 5 Oct). The approver's words are kept in
+  `order_approvals.reply`.
+- **A wait for the approver ends.** One reminder after 4 hours; after `WAIT_FOR_APPROVAL_HOURS` (24)
+  the week closes (`closed_not_approved`), nothing is sent, and the approver and staff are told to
+  order by hand. A yes after that sends nothing.
 - The only numbers the bot may text are `SUPPLIER_PHONE_NUMBER`, `EMPLOYEE_PHONE_NUMBERS` and
   `APPROVER_PHONE_NUMBER`.
 - Users: café staff on their phones. No screen, no login. Anything they need to do must work by SMS.
@@ -77,7 +81,13 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 | A yes releases something other than what the approver saw (re-worked from a later count), or releases it twice | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order` |
 | A yes from the wrong person, a day late, or for a request that never reached the approver sends an order | `test_a_yes_from_a_staff_number_is_not_an_approval`, `test_a_yes_after_the_wait_is_over_sends_nothing_and_closes_the_week`, `test_a_request_that_never_reached_the_boss_cannot_be_approved`, `test_next_weeks_request_replaces_one_the_boss_never_answered` |
 | A reply that is not a clear yes is taken as one ("yes but make the oat 4", "send me the count again"), or a model is asked what the approver meant | `test_replies_read_as_yes`, `test_replies_read_as_no`, `test_replies_that_are_neither_are_not_guessed`, `test_an_unclear_reply_sends_nothing_and_the_order_stays_open`, `test_no_model_reads_the_bosses_reply` |
-| A no sends the order anyway, loses the approver's reason, or (answered after a new Wednesday has started) cancels that week's order | `test_a_no_sends_nothing_and_keeps_the_reason`, `test_turning_down_an_order_asked_late_in_the_week_does_not_cancel_next_wednesdays` |
+| A no sends the order anyway, loses the approver's reason, or leaves staff with nothing to do | `test_a_no_sends_nothing_keeps_the_reason_and_asks_staff_to_count_again`, `test_a_no_books_the_reminder_and_closing_text_for_the_recount` |
+| The count the approver said no to is ordered from again: by a re-run, a forced run, the 4-hour reminder, or a part recount | `test_the_count_the_boss_turned_down_is_not_used_again`, `test_the_reminder_after_a_no_chases_the_recount_and_does_not_release_the_old_count`, `test_a_recount_after_a_no_goes_back_to_the_boss_and_their_yes_sends_it` |
+| After a no the week stays "handled", so the recount never produces an order — or a second no ends the recounts | `test_a_recount_after_a_no_goes_back_to_the_boss_and_their_yes_sends_it`, `test_a_second_no_asks_for_another_recount`, `test_no_recount_within_a_day_closes_the_week` |
+| Staff are told the order "goes out" once the count is in, when it goes to the approver first | `test_staff_are_told_the_order_goes_for_approval_not_straight_out`, `test_without_approval_staff_are_told_the_order_goes_out` |
+| The approver never answers and the week ends with no order and nobody told; or they are reminded twice, nagged after the deadline, or a new request is closed by an old closing job | `test_asking_the_boss_books_a_reminder_and_a_closing_text`, `test_a_silent_boss_gets_one_reminder_with_the_order_in_it`, `test_no_answer_in_a_day_closes_the_week_and_tells_the_boss_and_staff`, `test_a_reminder_that_runs_after_the_deadline_does_not_nag`, `test_a_closing_job_left_from_an_earlier_request_does_not_close_a_new_one`, `test_the_boss_is_not_chased_once_they_have_answered` |
+| A restart drops the approver's reminder and closing text, or lands between their yes and the send being recorded and nobody knows whether the supplier has the order | `test_a_restart_rebooks_the_follow_ups_for_an_order_still_with_the_boss`, `test_a_yes_cut_off_before_the_send_was_recorded_is_reported_not_assumed`, `test_a_yes_that_was_sent_and_recorded_is_left_alone_after_a_restart` |
+| An unanswered order asked late in the week closes the following Wednesday's week | `test_an_order_asked_late_in_the_week_and_never_answered_does_not_cancel_next_wednesdays` |
 | The supplier send errors after a yes and the approver and staff are told it was sent, or it is sent again | `test_supplier_send_error_after_a_yes_is_unconfirmed_and_not_resent` |
 | An approver who also counts stock has their count swallowed as an unclear answer | `test_a_boss_who_also_counts_stock_can_do_both` |
 
@@ -96,7 +106,13 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   later and the closing text 24 hours later (1:00pm Wednesday and 9:00am Thursday for the normal
   run). They live in memory, so startup re-books them for a request that is still open; a restart
   across the 4-hour mark drops the reminder, never the closing text. Every run and follow-up is
-  written to the `job_runs` table and to stdout (Railway logs).
+  written to the `job_runs` table and to stdout (Railway logs). An order sent for approval books
+  the same pair for the approver (`chase_approval`), timed from when they were asked and re-booked
+  at startup the same way. Every approval request, its answer and the approver's words are in the
+  `order_approvals` table.
+- Approval mutation check, 5 Oct: 56 deliberate breakages of the approval path, each caught by a
+  test. Not covered: the three startup calls in `__main__`, and a real SMS round trip (the Twilio
+  account had no number on 5 Oct).
 - Before merging to main or going live: run the `schneier` skill. Before handing over: `hightower`.
 
 ## Handover (for the next person, or the client)
