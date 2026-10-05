@@ -642,7 +642,8 @@ _NO_OPENERS = {"no", "n", "nope", "nah", "dont", "stop", "cancel", "reject", "re
 # must not be one.
 _NOT_A_NO = {
     "no worries", "no problem", "no problems", "no probs", "no changes", "no change", "no rush",
-    "no idea", "no need", "nah yeah", "dont worry", "dont know",
+    "no idea", "no need", "nah yeah", "dont worry", "dont know", "no dramas", "no drama",
+    "no stress", "no issues", "no issue", "no all good", "nah all good",
 }
 
 
@@ -678,7 +679,7 @@ def _read_approval_reply(body: str) -> bool | None:
         return False
 
     # From here it can only be a yes, and a yes is the whole message.
-    if _NOT_PART_OF_A_YES.search(text) or ".." in text:
+    if _NOT_PART_OF_A_YES.search(text) or re.search(r"\.\s*\.", text):  # "ok..." trails off
         return None
     rest = words if yes_emoji else _drop_phrase(words, _YES_START_PHRASES)
     while rest:

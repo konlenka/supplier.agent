@@ -946,7 +946,7 @@ def test_an_order_asked_late_in_the_week_and_never_answered_does_not_cancel_next
     "yes", "Yes.", "YES!", "y", "yep", "yeah", "yea", "yeh", "yup", "ok", "Okay", "ok thanks", "yes please",
     "yep send it", "approve", "approved", "confirm", "send it", "Send", "go ahead", "sure",
     "ok thank you", "Yes thankyou", "Yes, go ahead", "yes that's fine", "That's fine", "looks good",
-    "Sounds good", "Perfect", "ok do it", "Go for it", "Good to go", "Yes send it to the supplier",
+    "Sounds good", "Perfect", "Yes. Thanks.", "ok do it", "Go for it", "Good to go", "Yes send it to the supplier",
     "\U0001F44D", "\U0001F44D\U0001F3FD", "ok \U0001F44D", "\U0001F44D thanks", "\U0001F44C", "✅",
 ])
 def test_replies_read_as_yes(body):
@@ -974,7 +974,7 @@ def test_replies_read_as_no(body):
     "sure thing mate, what is it", "good morning", "do not send", "maybe", "8 almond 3 soy",
     # A yes is the whole message. Anything the reader cannot read after a yes-word is doubt it
     # cannot see: another emoji, another alphabet, a trailing-off, a full-width question mark.
-    "ok \U0001F914", "ok...", "ok…", "yes ✋", "ok ❌", "ok \U0001F645",
+    "ok \U0001F914", "ok...", "ok . . .", "ok. . .","ok…", "yes ✋", "ok ❌", "ok \U0001F645",
     "ok 等一下", "ok нет", "ok？", "\U0001F44D?", "\U0001F44D 4",
     "\U0001F44D ❌", "yes / no", "ok :(", "yes (maybe)",
     # "All good" can mean "leave it" as easily as "go ahead".
@@ -982,6 +982,7 @@ def test_replies_read_as_no(body):
     # Things that start with a no-word and are not a no. A wrong no is a wasted recount for staff.
     "No worries", "No problem", "no problem, send it", "No changes, send it", "Not sure", "Not now",
     "not yet", "not ok", "Wrong number", "wrong", "Nah yeah", "don't worry about it", "no rush", "no idea",
+    "No dramas", "No stress", "No issues", "No all good", "Nah all good",
 ])
 def test_replies_that_are_neither_are_not_guessed(body):
     assert app_module._read_approval_reply(body) is None

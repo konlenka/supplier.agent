@@ -134,6 +134,11 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   - The closing text for a count that never came still says "the next automatic order is next
     Wednesday" (it predates the approval work and is true for the normal Wednesday run).
   - A split reply ("ok", then "but make the oat 4" as a second text) sends the order on the first.
+  - A no-word followed by something that takes it back ("No that's fine, send it", "No sorry,
+    yes") is still a no and asks staff for a recount. It never sends an order.
+  - Some plain yeses are asked again rather than taken: "Yes :)", "Yes 😊", "Alright", "Correct".
+  - Three reviews by the `qa` agent on 5 Oct ended in "merge" at `f97e842`. The two small reader
+    changes after it (spaced-out dots, more `_NOT_A_NO` idioms) were not re-reviewed.
 - Before merging to main or going live: run the `schneier` skill. Before handing over: `hightower`.
 
 ## Handover (for the next person, or the client)
