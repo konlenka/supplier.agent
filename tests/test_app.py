@@ -943,18 +943,20 @@ def test_an_order_asked_late_in_the_week_and_never_answered_does_not_cancel_next
 
 
 @pytest.mark.parametrize("body", [
-    "yes", "Yes.", "YES!", "y", "yep", "yeah", "yup", "ok", "Okay", "ok thanks", "yes please",
-    "yep send it", "approve", "approved", "confirm", "send it", "Send", "go ahead", "sure", "\U0001F44D",
-    "ok thank you", "Yes, go ahead", "yes that's fine", "all good", "looks good", "ok do it", "ok \U0001F44D",
+    "yes", "Yes.", "YES!", "y", "yep", "yeah", "yea", "yeh", "yup", "ok", "Okay", "ok thanks", "yes please",
+    "yep send it", "approve", "approved", "confirm", "send it", "Send", "go ahead", "sure",
+    "ok thank you", "Yes thankyou", "Yes, go ahead", "yes that's fine", "That's fine", "looks good",
+    "Sounds good", "Perfect", "ok do it", "Go for it", "Good to go", "Yes send it to the supplier",
+    "\U0001F44D", "\U0001F44D\U0001F3FD", "ok \U0001F44D", "\U0001F44D thanks", "\U0001F44C", "✅",
 ])
 def test_replies_read_as_yes(body):
     assert app_module._read_approval_reply(body) is True
 
 
 @pytest.mark.parametrize("body", [
-    "no", "No.", "n", "nope", "nah", "no thanks", "No, too much oat", "not ok", "not yet",
-    "don't send", "don’t send it", "stop", "cancel", "reject", "wrong", "\U0001F44E",
-    "no problem, send it",  # reads as a no: a wrong no costs a phone call, a wrong yes costs an order
+    "no", "No.", "n", "nope", "nah", "no thanks", "No thanks mate", "No, too much oat", "No. Too much oat",
+    "no way", "don't send", "don’t send it", "stop", "cancel", "reject", "\U0001F44E",
+    "no \U0001F44D",  # a no-word wins over anything after it
 ])
 def test_replies_read_as_no(body):
     assert app_module._read_approval_reply(body) is False
@@ -970,6 +972,16 @@ def test_replies_read_as_no(body):
     "\U0001F44D\U0001F44E", "yes \U0001F44E", "yes 4", "ok you do it", "Ok new count almond 12 oat 8",
     "is that correct", "thanks mate", "it looks fine", "ok, is that all",
     "sure thing mate, what is it", "good morning", "do not send", "maybe", "8 almond 3 soy",
+    # A yes is the whole message. Anything the reader cannot read after a yes-word is doubt it
+    # cannot see: another emoji, another alphabet, a trailing-off, a full-width question mark.
+    "ok \U0001F914", "ok...", "ok…", "yes ✋", "ok ❌", "ok \U0001F645",
+    "ok 等一下", "ok нет", "ok？", "\U0001F44D?", "\U0001F44D 4",
+    "\U0001F44D ❌", "yes / no", "ok :(", "yes (maybe)",
+    # "All good" can mean "leave it" as easily as "go ahead".
+    "all good", "ok all good", "go", "\U0001F44D maybe", "\U0001F44D but check the oat",
+    # Things that start with a no-word and are not a no. A wrong no is a wasted recount for staff.
+    "No worries", "No problem", "no problem, send it", "No changes, send it", "Not sure", "Not now",
+    "not yet", "not ok", "Wrong number", "wrong", "Nah yeah", "don't worry about it", "no rush", "no idea",
 ])
 def test_replies_that_are_neither_are_not_guessed(body):
     assert app_module._read_approval_reply(body) is None
@@ -1623,6 +1635,76 @@ def test_the_approver_number_is_matched_however_it_was_typed():
     assert config._phone(" +61 400-000 009 ") == "+61400000009"
     assert config._phone("(+61)400000009") == "+61400000009"
     assert config._phone("") == ""
+
+
+def test_startup_rebooks_the_follow_ups_for_an_order_still_with_the_boss(bot, boss):
+    _order_waiting_for_the_boss(bot)
+    _clear_approval_jobs()
+
+    app_module._resume_after_restart()
+
+    assert {"chase_approval", "chase_approval_final"} <= set(_approval_jobs())
+    assert bot == []  # an ordinary restart texts nobody
+
+
+def test_startup_rebooks_the_follow_ups_for_a_count_still_being_waited_on(bot):
+    app_module.run_weekly_order()  # no count: staff asked
+    _clear_follow_up_jobs()
+    bot.clear()
+
+    app_module._resume_after_restart()
+
+    assert "chase_count_final" in _follow_up_jobs()
+    assert bot == []
+
+
+def test_startup_reports_a_yes_that_was_cut_off(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+    storage.decide_approval(pending.id, storage.APPROVAL_APPROVED, "yes")
+
+    app_module._resume_after_restart()
+
+    assert any("may not have reached" in body for _, body in bot)
+    assert _to_supplier(bot) == []
+
+
+def test_startup_picks_up_a_no_that_was_cut_off(bot, boss):
+    pending = _order_waiting_for_the_boss(bot)
+    storage.decide_approval(pending.id, storage.APPROVAL_REJECTED, "no")
+
+    app_module._resume_after_restart()
+
+    assert len(bot) == len(STAFF) and all("count the milk again" in body for _, body in bot)
+
+
+def test_startup_cancels_an_order_left_waiting_when_approval_was_switched_off(bot, boss, monkeypatch):
+    _order_waiting_for_the_boss(bot)
+    _clear_approval_jobs()
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", "")
+
+    app_module._resume_after_restart()
+
+    assert [status for status, _ in _approvals()] == ["cancelled"]
+    assert len(bot) == len(STAFF)
+    assert _approval_jobs() == {}  # cancelled before the follow-ups were booked, so none are
+
+
+def test_closing_texts_do_not_promise_when_the_next_automatic_order_is(bot, boss, monkeypatch):
+    """An order asked late in the week can close after the next Wednesday has started, and
+    that Wednesday's run then goes ahead: "the next automatic order is next Wednesday" was untrue."""
+    _order_waiting_for_the_boss(bot)
+    _backdate_approvals(timedelta(hours=25))
+    app_module.chase_approval(final=True)
+    assert not any("next Wednesday" in body for _, body in bot)
+
+    bot.clear()
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    monkeypatch.setattr(app_module, "APPROVER_PHONE_NUMBER", "")
+    bot.clear()
+    app_module._drop_orphaned_approval()
+    assert bot != [] and not any("next Wednesday" in body for _, body in bot)
 
 
 def test_with_no_approver_set_nothing_is_held(bot):

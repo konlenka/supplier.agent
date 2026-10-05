@@ -80,7 +80,7 @@ TRIGGER_KEY=a-long-random-string
 | `TWILIO_PHONE_NUMBER` | The Australian number you buy in Twilio |
 | `SUPPLIER_PHONE_NUMBER` | Your milk supplier's mobile number |
 | `EMPLOYEE_PHONE_NUMBERS` | Comma-separated staff numbers who report stock |
-| `APPROVER_PHONE_NUMBER` | Optional. The person who must reply YES before an order goes to the supplier (see "Approval during the trial"). Leave it out to send orders with no approval |
+| `APPROVER_PHONE_NUMBER` | Optional. The person who must reply YES before an order goes to the supplier (see "Approval during the trial"). International format, `+614…`, not `04…`: a number written any other way is never recognised as the approver. Leave it out to send orders with no approval |
 | `ANTHROPIC_API_KEY` | [Anthropic Console](https://console.anthropic.com) → API Keys |
 
 > **Twilio trial accounts:** You must verify every number you send to (including the supplier) before messages will go through. Once you upgrade to a paid account, this restriction is removed.
@@ -178,9 +178,9 @@ While `APPROVER_PHONE_NUMBER` is set, no order reaches the supplier until that p
 
 1. When the order is worked out, it is texted to the approver with the stock counts it was worked out from. Staff get a text saying the order is waiting for approval.
 2. The approver replies by text:
-   - **Yes** (yes, y, yep, ok, approve, 👍, "send it", optionally with "thanks" or "please"): the order they were shown goes to the supplier and staff get the usual summary.
-   - **No** (anything starting with no, nope, nah, not or don't, such as "no, too much oat"): nothing is sent. Staff are asked to count again, and the new order comes back to the approver. This repeats for every no. The approver's reply is kept, so the reason for a no is on record.
-   - **Anything else**: nothing is sent and the system asks for YES or NO. That includes a yes with anything added to it: "ok I'll check first", "yes make the oat 4" and "ok?" do not send the order. The approver cannot change quantities by text.
+   - **Yes** (yes, y, yep, yeah, ok, sure, approve, confirm, "send it", "go ahead", 👍 👌 ✅, optionally with "thanks" or "please"): the order they were shown goes to the supplier and staff get the usual summary.
+   - **No** (anything starting with no, nope, nah, don't, stop, cancel or reject, such as "no, too much oat", or 👎): nothing is sent. Staff are asked to count again, and the new order comes back to the approver. This repeats for every no. The approver's reply is kept, so the reason for a no is on record.
+   - **Anything else**: nothing is sent and the system asks for YES or NO. A yes has to be the whole reply: "ok I'll check first", "yes make the oat 4", "ok?", "ok..." and "ok 🤔" do not send the order, and neither do "all good", "no worries" or "not sure". The approver cannot change quantities by text.
 3. If the approver doesn't answer, they get one reminder after 4 hours. After 24 hours the order is not sent, and the approver and staff are told to order by hand. A yes after that sends nothing.
 4. The approver also gets a text when a week ends with nothing for them to approve: no order was needed, or a count never came in.
 

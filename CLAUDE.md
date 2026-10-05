@@ -80,11 +80,13 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 | With approval on, an order reaches the supplier without a yes: straight from the run, from a re-run or forced run while one is waiting, or from a count that completes the wait | `test_with_approval_on_the_order_goes_to_the_boss_and_not_the_supplier`, `test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing`, `test_a_count_that_completes_the_wait_goes_to_the_boss_and_staff_are_told_so` |
 | A yes releases something other than what the approver saw (re-worked from a later count), or releases it twice | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order` |
 | A yes from the wrong person, a day late, or for a request that never reached the approver sends an order | `test_a_yes_from_a_staff_number_is_not_an_approval`, `test_a_yes_after_the_wait_is_over_sends_nothing_and_closes_the_week`, `test_a_request_that_never_reached_the_boss_cannot_be_approved`, `test_next_weeks_request_replaces_one_the_boss_never_answered` |
-| A reply that is not a plain yes is taken as one. "Ok" is also how people acknowledge a text: "ok I'll check the fridge first", "yes make the oat 4", "ok?" and "ok, is that all" each sent the order before the 5 Oct review. A yes is a yes-word followed only by phrases from `_YES_TAILS`; add to that list with care, and never as loose words | `test_replies_read_as_yes`, `test_replies_read_as_no`, `test_replies_that_are_neither_are_not_guessed`, `test_an_unclear_reply_sends_nothing_and_the_order_stays_open`, `test_no_model_reads_the_bosses_reply` |
+| A reply that is not a plain yes is taken as one. "Ok" is also how people acknowledge a text: "ok I'll check the fridge first", "yes make the oat 4", "ok?", "ok, is that all", "ok 🤔" and "ok нет" each sent the order at some point in the 5 Oct reviews. A yes is the whole message: a yes-word followed only by phrases from `_YES_TAILS`, written only with the characters `_NOT_PART_OF_A_YES` allows. Add to those lists with care, never as loose words, and never widen the allowed characters. On the no side, "no worries" and "not sure" must not send staff back to count (`_NOT_A_NO`) | `test_replies_read_as_yes`, `test_replies_read_as_no`, `test_replies_that_are_neither_are_not_guessed`, `test_an_unclear_reply_sends_nothing_and_the_order_stays_open`, `test_no_model_reads_the_bosses_reply` |
 | Two requests act on the same waiting order (two yeses at once, a yes racing the closing job) and it is sent twice. The claim in `storage.decide_approval` is what stops it; the order lock alone is not tested | `test_two_requests_acting_on_the_same_waiting_order_send_it_once`, `test_a_no_or_a_closing_text_acting_on_an_order_already_dealt_with_does_nothing`, `test_simultaneous_yeses_send_one_order` |
 | The approver is told "you'll get the new order to approve" and then hears nothing: the recount never came, it needed no order, or the request to recount reached no staff | `test_no_recount_within_a_day_closes_the_week`, `test_a_recount_that_needs_no_order_tells_the_boss_too`, `test_a_no_that_reaches_no_staff_tells_the_boss_so` |
 | Approval is switched off (variable removed) while an order is waiting: it sits "waiting" for ever, and a follow-up later tells staff nothing was sent after a forced run sent it | `test_switching_approval_off_while_an_order_waits_cancels_it_and_tells_staff`, `test_an_order_still_waiting_is_untouched_at_startup_while_approval_is_on`, `test_no_reminder_is_attempted_with_no_approver_number` |
 | A restart lands between the approver's no and staff being asked to recount: the week is open with no request, no follow-ups and nobody told | `test_a_no_cut_off_before_staff_were_asked_is_picked_up_after_a_restart`, `test_a_no_that_was_fully_handled_is_left_alone_after_a_restart` |
+| A recovery step is dropped from `_resume_after_restart`, or the orphaned order has follow-ups booked before it is cancelled | The five `test_startup_…` tests |
+| A closing text promises "the next automatic order is next Wednesday" when an order asked late in the week closes after that Wednesday has started | `test_closing_texts_do_not_promise_when_the_next_automatic_order_is` |
 | An approver who also counts stock sends a count that starts with "no" or "ok" and it is read as their answer | `test_a_boss_who_also_counts_stock_has_a_recount_starting_with_no_saved_as_a_count`, `test_a_count_texted_by_the_boss_while_an_order_waits_does_not_approve_it` |
 | `APPROVER_PHONE_NUMBER` typed with spaces never matches the sender, so no yes is ever recognised | `test_the_approver_number_is_matched_however_it_was_typed` |
 | A no sends the order anyway, loses the approver's reason, or leaves staff with nothing to do | `test_a_no_sends_nothing_keeps_the_reason_and_asks_staff_to_count_again`, `test_a_no_books_the_reminder_and_closing_text_for_the_recount` |
@@ -116,14 +118,22 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   the same pair for the approver (`chase_approval`), timed from when they were asked and re-booked
   at startup the same way. Every approval request, its answer and the approver's words are in the
   `order_approvals` table.
-- Approval mutation check, 5 Oct: 78 deliberate breakages of the approval path, each caught by a
+- Approval mutation check, 5 Oct: 95 deliberate breakages of the approval path, each caught by a
   test. Not covered: that `__main__` calls `_resume_after_restart`, the order lock around the
   approval paths (the claim in `decide_approval` is what the tests prove), whether the yes path's
   sends fit inside Twilio's 15-second webhook limit, how Twilio treats STOP/CANCEL from the
   approver, and a real SMS round trip (the Twilio account had no number on 5 Oct).
-- Known and left: while an order is waiting, a count texted by an approver who also counts stock is
-  not saved (they are asked for YES or NO). An order asked on a Tuesday and approved before 9:00 on
-  Wednesday makes that Wednesday's run a silent `skipped`, not `recent_order` with a text.
+- Known and left:
+  - While an order is waiting, a text from an approver who also counts stock is read as their
+    answer, never as a count: one starting with "no" asks staff for a recount, anything else gets
+    "Reply YES or NO". The count itself is not saved.
+  - If the run-log write fails after a no (`_log_run` swallows the error), the week sits open with
+    no request until the next restart, when `_recover_interrupted_no` asks.
+  - An order asked on a Tuesday and approved before 9:00 on Wednesday makes that Wednesday's run a
+    silent `skipped`, not `recent_order` with a text.
+  - The closing text for a count that never came still says "the next automatic order is next
+    Wednesday" (it predates the approval work and is true for the normal Wednesday run).
+  - A split reply ("ok", then "but make the oat 4" as a second text) sends the order on the first.
 - Before merging to main or going live: run the `schneier` skill. Before handing over: `hightower`.
 
 ## Handover (for the next person, or the client)

@@ -610,23 +610,40 @@ def _ask_for_approval(
 
 # How the approver's reply is read. A fixed list, not a model: whether an order goes must
 # not rest on a guess. Anything the list does not settle is asked again.
+#
+# A yes is the whole message and nothing else: a yes-word, then only phrases from
+# _YES_TAILS. "Ok" is how people acknowledge a text as well as how they agree to it, so "ok
+# I'll check the fridge first", "yes make the oat 4", "ok?" and "ok, is that all" are not a
+# yes. Neither is "ok" followed by anything this reader cannot read — another emoji, another
+# alphabet, a trailing "..." — because that is doubt it cannot see. Whole phrases, not loose
+# words: loose words recombine into things nobody meant as a yes.
 _YES_OPENERS = {
-    "yes", "y", "yep", "yeah", "yup", "ya", "ok", "okay", "k", "sure",
+    "yes", "y", "yep", "yeah", "yea", "yeh", "yup", "ya", "ok", "okay", "k", "sure",
     "approve", "approved", "confirm", "confirmed",
 }
-# Other ways to start a yes: "send it" is one, "send me the count again" is not.
-_YES_WHOLE_REPLIES = {"send", "send it", "go", "go ahead", "do it", "all good", "looks good"}
-# The only things that may follow a yes and leave it a yes. "Ok" is how people acknowledge
-# a text as well as how they agree to it, so "ok I'll check the fridge first", "yes make the
-# oat 4", "ok?" and "ok, is that all" are not a yes: anything but these phrases, a number
-# or a question mark, and the reply is asked again. Whole phrases, not loose words — loose
-# words recombine into things nobody meant as a yes.
-_YES_TAILS = {
-    "please", "pls", "thanks", "thx", "ty", "cheers", "mate", "perfect", "great", "good", "fine",
-    "correct", "sounds good", "thats fine", "thats correct", "thats right", "thats good", "thats great",
+# Other ways to start a yes: "send it" is one, "send me the count again" is not. "All good"
+# is left out on purpose: it means "leave it" as easily as "go ahead".
+_YES_WHOLE_REPLIES = {
+    "send", "send it", "go ahead", "go for it", "good to go", "do it", "looks good",
+    "sounds good", "perfect", "thats fine",
 }
-_NO_OPENERS = {"no", "n", "nope", "nah", "not", "dont", "stop", "cancel", "reject", "rejected", "wrong"}
-_THUMBS_UP, _THUMBS_DOWN = "\U0001F44D", "\U0001F44E"
+_YES_TAILS = {
+    "please", "pls", "thanks", "thx", "ty", "cheers", "mate", "great", "good", "fine", "correct",
+    "thats correct", "thats right", "thats good", "thats great", "to the supplier",
+}
+_YES_EMOJI = "\U0001F44D\U0001F44C✅"  # thumbs up, OK hand, tick
+_THUMBS_DOWN = "\U0001F44E"
+# Everything a yes may be written with: letters, spaces, a full stop, comma or exclamation
+# mark, a yes emoji and its skin tone. Any other character and it is not a plain yes.
+_NOT_PART_OF_A_YES = re.compile(rf"[^a-z\s.,!{_YES_EMOJI}\U0001F3FB-\U0001F3FF️]")
+
+_NO_OPENERS = {"no", "n", "nope", "nah", "dont", "stop", "cancel", "reject", "rejected"}
+# Starts with a no-word and is not a no. A no sends staff back to count, so "no worries"
+# must not be one.
+_NOT_A_NO = {
+    "no worries", "no problem", "no problems", "no probs", "no changes", "no change", "no rush",
+    "no idea", "no need", "nah yeah", "dont worry", "dont know",
+}
 
 
 def _phrases(texts: set[str]) -> list[tuple[str, ...]]:
@@ -636,6 +653,7 @@ def _phrases(texts: set[str]) -> list[tuple[str, ...]]:
 
 _YES_START_PHRASES = _phrases(_YES_OPENERS | _YES_WHOLE_REPLIES)
 _YES_TAIL_PHRASES = _phrases(_YES_OPENERS | _YES_WHOLE_REPLIES | _YES_TAILS)
+_NOT_A_NO_PHRASES = _phrases(_NOT_A_NO)
 
 
 def _drop_phrase(words: list[str], phrases: list[tuple[str, ...]]) -> list[str] | None:
@@ -647,18 +665,22 @@ def _drop_phrase(words: list[str], phrases: list[tuple[str, ...]]) -> list[str] 
 
 
 def _read_approval_reply(body: str) -> bool | None:
-    """True for a yes, False for a no, None when it is neither or it is unclear. Leans
-    towards no: a wrong no costs a phone call, a wrong yes costs an order."""
-    text = body.strip().lower().replace("'", "").replace("\u2019", "").replace("thank you", "thanks")
+    """True for a yes, False for a no, None when it is neither or it is unclear. A no may
+    carry a reason ("no, too much oat"); a yes may carry nothing but thanks."""
+    text = body.strip().lower().replace("'", "").replace("’", "")
+    text = text.replace("thank you", "thanks").replace("thankyou", "thanks")
     words = re.findall(r"[a-z]+", text)
-    thumbs_up, thumbs_down = _THUMBS_UP in text, _THUMBS_DOWN in text
-    if not words:
-        return thumbs_up if thumbs_up != thumbs_down else None
-    if words[0] in _NO_OPENERS:
+    yes_emoji = any(mark in text for mark in _YES_EMOJI)
+
+    if words and words[0] in _NO_OPENERS and _drop_phrase(words, _NOT_A_NO_PHRASES) is None:
         return False
-    if thumbs_down or re.search(r"[0-9?]", text):
+    if not words and _THUMBS_DOWN in text and not yes_emoji:
+        return False
+
+    # From here it can only be a yes, and a yes is the whole message.
+    if _NOT_PART_OF_A_YES.search(text) or ".." in text:
         return None
-    rest = _drop_phrase(words, _YES_START_PHRASES)
+    rest = words if yes_emoji else _drop_phrase(words, _YES_START_PHRASES)
     while rest:
         rest = _drop_phrase(rest, _YES_TAIL_PHRASES)
     return True if rest == [] else None
@@ -780,7 +802,7 @@ def _close_unanswered(approval: Approval) -> bool:
     logger.warning("No answer from the approver in time — this week's order was not sent")
     reached = _notify_employees(
         "This week's milk order was not approved in time, so it has NOT been sent to the "
-        "supplier. Please order by hand. The next automatic order is next Wednesday."
+        "supplier. Please order by hand."
     )
     # Dated to the day the approver was asked: this closes that order's week, and must
     # not count against a Wednesday that has started since.
@@ -1040,8 +1062,7 @@ def _drop_orphaned_approval() -> None:
             logger.warning("Approval was switched off with an order waiting on it — cancelling that order")
             reached = _notify_employees(
                 "This week's milk order was waiting for approval when approval was switched "
-                "off, so it has NOT been sent to the supplier. Please order by hand. The next "
-                "automatic order is next Wednesday."
+                "off, so it has NOT been sent to the supplier. Please order by hand."
             )
             _log_run(
                 approval.order_date,
