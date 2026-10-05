@@ -67,6 +67,16 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data", "stock.db")
 # Staleness threshold in days — if stock report is older than this, request an update
 STALE_THRESHOLD_DAYS = 3
 
+# How long the supplier takes to deliver after the order text. THELO ASSUMPTION, not confirmed
+# with the cafe — ask them and set it. Until that long after an order, no stock count can
+# include its delivery, so the bot will not order again from one (it would order the same
+# shortfall twice). Must stay under 4: in a normal week the next count comes 4+ days later.
+DELIVERY_DAYS = 2
+
+# How long an order waits for a missing stock count before the bot gives up and tells staff
+# to order by hand. Without an end, a count texted days later still released an order.
+WAIT_FOR_COUNT_HOURS = 24
+
 # An order sent within this many days blocks another one, so a restart, a retry or the
 # manual trigger can't send the supplier the same order twice in one week.
 MIN_DAYS_BETWEEN_ORDERS = 6

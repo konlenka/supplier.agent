@@ -62,31 +62,6 @@ def calculate_order(
     return order_lines
 
 
-def cap_to_calculated(
-    agent_lines: list[OrderLine],
-    calculated_lines: list[OrderLine],
-) -> tuple[list[OrderLine], list[str]]:
-    """Limit the ordering agent's quantities to what the stock arithmetic allows.
-
-    The agent may order less than the calculated deficit (it sees order history) but
-    never more — the order goes to the supplier with nobody checking it first.
-    Returns the capped lines and a note for each line that was reduced.
-    """
-    ceiling = {ol.item: ol.quantity for ol in calculated_lines}
-    capped: list[OrderLine] = []
-    notes: list[str] = []
-
-    for ol in agent_lines:
-        limit = ceiling.get(ol.item, 0)
-        if ol.quantity > limit:
-            notes.append(f"{ol.label}: agent asked for {ol.quantity}, capped to {limit}")
-        quantity = min(ol.quantity, limit)
-        if quantity > 0:
-            capped.append(OrderLine(item=ol.item, label=ol.label, quantity=quantity))
-
-    return capped, notes
-
-
 def format_order_message(
     order_lines: list[OrderLine],
     order_date: date,

@@ -32,7 +32,8 @@ LOW_STOCK = {
 
 @pytest.fixture
 def bot(tmp_path, monkeypatch):
-    """The app with a throwaway database, a fixed date and no real SMS or model calls."""
+    """The app with a throwaway database, a fixed date and no real SMS. The order job makes
+    no model call; the one model call in the app (reading a staff text) is replaced in `sms`."""
     monkeypatch.setattr(storage, "DB_PATH", str(tmp_path / "data" / "stock.db"))
     storage.init_db()
 
@@ -41,11 +42,6 @@ def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "SUPPLIER_PHONE_NUMBER", SUPPLIER)
     monkeypatch.setattr(app_module, "EMPLOYEE_PHONE_NUMBERS", STAFF)
     monkeypatch.setattr(app_module, "_melbourne_today", lambda: WEDNESDAY)
-
-    def agent_fails(current_stock, order_date):
-        raise RuntimeError("no model in tests")
-
-    monkeypatch.setattr(app_module, "run_order_agent", agent_fails)
     return sent
 
 
@@ -112,10 +108,30 @@ def test_order_week_runs_wednesday_to_tuesday():
     assert app_module._order_week(WEDNESDAY + timedelta(days=7)) == WEDNESDAY + timedelta(days=7)
 
 
+def _backdate_stock(delta):
+    """Make every count on file look `delta` older."""
+    conn = storage._get_connection()
+    try:
+        for row in conn.execute("SELECT item, updated_at FROM current_stock").fetchall():
+            older = (datetime.fromisoformat(row["updated_at"]) - delta).isoformat()
+            conn.execute("UPDATE current_stock SET updated_at = ? WHERE item = ?", (older, row["item"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_details(outcome):
+    conn = storage._get_connection()
+    try:
+        rows = conn.execute("SELECT detail FROM job_runs WHERE outcome = ? ORDER BY id", (outcome,))
+        return [row["detail"] for row in rows.fetchall()]
+    finally:
+        conn.close()
+
+
 def test_order_released_late_does_not_cancel_next_wednesdays_order(bot, monkeypatch):
     app_module.run_weekly_order()  # Wednesday: no count -> stale
-    friday = WEDNESDAY + timedelta(days=2)
-    _set_today(monkeypatch, friday)
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=1))  # staff answer early Thursday
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
     assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
 
@@ -123,10 +139,148 @@ def test_order_released_late_does_not_cancel_next_wednesdays_order(bot, monkeypa
     _set_today(monkeypatch, WEDNESDAY + timedelta(days=6))
     assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
 
-    # Next Wednesday is five days after the Friday order and must still go out.
+    # Next Wednesday is six days after the Thursday order and must still go out,
+    # from a count taken since that delivery.
+    _backdate_runs(timedelta(days=6))
+    _backdate_stock(timedelta(days=6))
     _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    storage.save_stock_report(STAFF[0], "recount", LOW_STOCK)
     assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
     assert len(_to_supplier(bot)) == 2
+
+
+def test_no_order_while_the_last_delivery_is_still_on_its_way(bot, sms, monkeypatch):
+    """An order went out yesterday (a late release, or a forced run). Whatever counts
+    arrive, today's run must not order: no count can include that delivery yet."""
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=6))  # the Tuesday
+    assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
+    _backdate_runs(timedelta(days=1))
+    _backdate_stock(timedelta(days=1))
+    # A further text after the order — a correction, the other barista, the routine count.
+    storage.save_stock_report(STAFF[1], "count again", LOW_STOCK)
+    bot.clear()
+
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    assert app_module.run_weekly_order() == app_module.OUTCOME_RECENT_ORDER
+    assert _to_supplier(bot) == []
+    assert {to for to, _ in bot} == set(STAFF)
+    assert "An order went to the supplier on Tuesday 19/5" in bot[0][1]
+    assert "automatic milk order is skipped" in bot[0][1]
+
+    # The week is settled, not waiting: no reminder, and a count only records stock.
+    bot.clear()
+    assert app_module.chase_missing_count() == []
+    assert app_module.chase_missing_count(final=True) == []
+    reply = sms("another count", LOW_STOCK)
+    assert "order" not in reply.lower()
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert bot == []
+
+
+def test_count_from_before_the_delivery_was_due_is_asked_for_again(bot):
+    """The order went three days ago and the count on file is two days old: recent, but
+    taken before the delivery was due. The run asks for a recount instead of ordering."""
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_ORDERED
+    _backdate_runs(timedelta(days=3))
+    conn = storage._get_connection()
+    conn.execute("DELETE FROM job_runs WHERE outcome != ?", (app_module.OUTCOME_ORDERED,))
+    conn.execute("UPDATE job_runs SET run_date = ?", ((WEDNESDAY - timedelta(days=3)).isoformat(),))
+    conn.commit()
+    conn.close()
+    _backdate_stock(timedelta(days=2, hours=1))  # after the order, before delivery was due
+    bot.clear()
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
+    assert _to_supplier(bot) == []
+    assert "An order went to the supplier on Sunday 10/5" in bot[0][1]
+    # The delivery time is an estimate: staff are told to wait for the milk, not just the clock.
+    assert "Please count again once that delivery has arrived" in bot[0][1]
+    assert len(app_module._still_needed(WEDNESDAY)) == 5  # the SMS path applies the same rule
+
+    storage.save_stock_report(STAFF[0], "recount", LOW_STOCK)
+    assert app_module._still_needed(WEDNESDAY) == []
+    assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_ordinary_week_with_no_new_count_gets_the_ordinary_request(bot, monkeypatch):
+    """Last week's order was delivered long ago; nobody has counted since. That is the plain
+    "no recent count" case — the recount wording would wrongly blame last week's order."""
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    _backdate_runs(timedelta(days=7))
+    _backdate_stock(timedelta(days=7))
+    bot.clear()
+
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
+    assert "It's ordering day but we don't have a recent stock count" in bot[0][1]
+    assert "An order" not in bot[0][1]
+
+
+def test_unconfirmed_send_also_holds_the_next_order_and_is_described_honestly(bot, monkeypatch):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    real_send = app_module.send_sms
+
+    def supplier_times_out(to, body):
+        if to == SUPPLIER:
+            raise RuntimeError("read timeout")
+        return real_send(to, body)
+
+    monkeypatch.setattr(app_module, "send_sms", supplier_times_out)
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=6))
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SEND_UNCONFIRMED
+    monkeypatch.setattr(app_module, "send_sms", real_send)
+    bot.clear()
+
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=7))
+    assert app_module.run_weekly_order() == app_module.OUTCOME_RECENT_ORDER
+    assert _to_supplier(bot) == []
+    assert "may not have reached the supplier" in bot[0][1]
+    assert "went to the supplier" not in bot[0][1]
+
+
+def test_count_must_be_taken_once_the_delivery_is_due():
+    now = datetime(2026, 5, 13, tzinfo=timezone.utc)
+    due = now - timedelta(hours=10)
+    stock = {
+        key: StockLevel(key, 1, level.unit, reported_at=due - timedelta(seconds=1))
+        for key, level in FULL_STOCK.items()
+    }
+    stock["soy_milk"].reported_at = due  # counted the moment the delivery was due: usable
+
+    stale = app_module._stale_items(stock, now, delivered_by=due)
+
+    assert "Soy Milk" not in stale and len(stale) == 4
+    assert app_module._stale_items(stock, now) == []
+
+
+def test_forced_run_may_reuse_the_counts_the_last_order_was_made_from(bot):
+    """force=1 is a deliberate re-send. It is the only run exempt from the delivery rule."""
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()
+    _backdate_runs(timedelta(minutes=30))
+    _backdate_stock(timedelta(minutes=60))  # the count predates the order
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED  # unforced: handled
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_ORDERED
+    assert len(_to_supplier(bot)) == 2
+
+
+def test_forced_run_without_a_fresh_count_does_not_reopen_a_handled_week(bot):
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()  # ordered: the week is handled
+    _backdate_runs(timedelta(minutes=30))
+    _backdate_stock(timedelta(days=5))  # counts have gone stale since
+    bot.clear()
+
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_SKIPPED
+    assert bot == []  # staff are not told "the order has not gone" when it has
+    assert app_module._open_request(WEDNESDAY) is None
+    assert app_module.chase_missing_count() == []
+    assert app_module.chase_missing_count(final=True) == []
 
 
 def test_counts_fresh_when_the_job_asked_still_release_the_order(bot):
@@ -142,10 +296,10 @@ def test_counts_fresh_when_the_job_asked_still_release_the_order(bot):
     assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
     assert "stock count for: Coconut." in bot[0][1]
 
-    # Staff answer a day later — the earlier counts are now over 3 days old.
-    _backdate_runs(timedelta(days=1))
+    # Staff answer 20 hours later — the earlier counts are now over 3 days old.
+    _backdate_runs(timedelta(hours=20))
     conn = storage._get_connection()
-    older = (datetime.now(timezone.utc) - timedelta(days=3, hours=12)).isoformat()
+    older = (datetime.now(timezone.utc) - timedelta(days=3, hours=8)).isoformat()
     conn.execute("UPDATE current_stock SET updated_at = ?", (older,))
     conn.commit()
     conn.close()
@@ -156,13 +310,25 @@ def test_counts_fresh_when_the_job_asked_still_release_the_order(bot):
     assert len(_to_supplier(bot)) == 1
 
 
-def test_agent_cannot_cancel_an_order_when_stock_is_short(bot, monkeypatch):
+def test_order_job_makes_no_model_call(bot, monkeypatch):
+    """The order is arithmetic. If a model client is ever built during the order job,
+    a model is deciding quantities again — and nobody checks the order before it sends."""
+    import anthropic
+
+    clients_built = []
+
+    def no_model(*args, **kwargs):
+        # Recorded as well as raised: a model call wrapped in try/except (as the old
+        # ordering agent's was) would swallow the error and still pass a raise-only check.
+        clients_built.append(args)
+        raise RuntimeError("the order job must not call a model")
+
+    monkeypatch.setattr(anthropic, "Anthropic", no_model)
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
-    monkeypatch.setattr(app_module, "run_order_agent", lambda stock, order_date: [])
 
     assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
     assert "Almond * 4" in _to_supplier(bot)[0]
-    assert not any("Stock levels are good" in body for _, body in bot)
+    assert clients_built == []
 
 
 def test_missed_run_is_detected_only_on_order_day_after_nine(bot):
@@ -189,6 +355,8 @@ def test_no_stock_count_asks_staff_and_orders_nothing(bot):
     assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
     assert _to_supplier(bot) == []
     assert {to for to, _ in bot} == set(STAFF)
+    assert "within 24 hours, please order by hand" in bot[0][1]
+    assert "An order" not in bot[0][1]  # the recount wording is only for a count that predates a delivery
 
 
 def test_one_fresh_item_does_not_hide_the_missing_ones(bot):
@@ -209,26 +377,6 @@ def test_stale_items_flags_old_counts():
     }
     stock["soy_milk"].reported_at = now - timedelta(days=4)
     assert app_module._stale_items(stock, now) == ["Soy Milk"]
-
-
-def test_agent_cannot_order_more_than_the_arithmetic(bot, monkeypatch):
-    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
-    monkeypatch.setattr(
-        app_module,
-        "run_order_agent",
-        lambda stock, order_date: [
-            OrderLine("almond_milk", "Almond Milk", 400),
-            OrderLine("oat_milk", "Oat Milk", 9),  # oat is full — nothing to order
-            OrderLine("soy_milk", "Soy Milk", 2),  # ordering less is allowed
-        ],
-    )
-
-    app_module.run_weekly_order()
-
-    msg = _to_supplier(bot)[0]
-    assert "Almond * 4" in msg
-    assert "Oat * 0" in msg
-    assert "Soy * 2" in msg
 
 
 def test_full_stock_orders_nothing_and_is_not_repeated(bot):
@@ -331,6 +479,289 @@ def test_late_count_by_sms_releases_the_waiting_order(bot, sms):
     reply = sms("full count again", LOW_STOCK)
     assert "order" not in reply.lower()
     assert len(_to_supplier(bot)) == 1
+
+
+def test_missing_count_gets_one_reminder_and_the_count_still_releases_the_order(bot, sms):
+    app_module.run_weekly_order()  # no stock -> stale, staff asked once
+    storage.save_stock_report(STAFF[0], "almond 8", {"almond_milk": LOW_STOCK["almond_milk"]})
+    bot.clear()
+
+    missing = app_module.chase_missing_count()
+    assert "Oat Milk" in missing and "Almond Milk" not in missing
+    assert {to for to, _ in bot} == set(STAFF)
+    assert "has not gone out yet" in bot[0][1] and "Oat Milk" in bot[0][1]
+    # The deadline in the text is the real one: a day after the request, in the café's time.
+    request = app_module._open_request(WEDNESDAY)
+    ends = (request.at + timedelta(hours=24)).astimezone(app_module.MELBOURNE_TZ)
+    spoken = f"{ends.hour % 12 or 12}:{ends.minute:02d}{'am' if ends.hour < 12 else 'pm'} {ends:%A}"
+    assert f"isn't in by {spoken}, please order by hand" in bot[0][1]
+    assert _run_details(app_module.OUTCOME_CHASED) == [
+        "reminder for Oat Milk, Soy Milk, Lactose Free, Coconut; reached 2 of 2 staff"
+    ]
+
+    # Run again (a restart, a scheduler retry): staff are not texted the reminder twice.
+    bot.clear()
+    assert app_module.chase_missing_count() == []
+    assert bot == []
+
+    # A reminder is not a run of the order job: the week still reads as waiting,
+    # and the count still releases the order.
+    reply = sms("full count", LOW_STOCK)
+    assert "placing this week's order now" in reply
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_no_count_by_thursday_closes_the_week_and_a_late_count_only_records_stock(bot, sms, monkeypatch):
+    app_module.run_weekly_order()  # Wednesday: stale
+    bot.clear()
+
+    _backdate_runs(timedelta(hours=24))  # a day has passed
+    _set_today(monkeypatch, WEDNESDAY + timedelta(days=1))
+    missing = app_module.chase_missing_count(final=True)
+    assert len(missing) == 5
+    assert {to for to, _ in bot} == set(STAFF)
+    assert "has NOT been placed" in bot[0][1] and "order from the supplier by hand" in bot[0][1]
+    assert "closed for this week" in bot[0][1]
+    assert _run_details(app_module.OUTCOME_CLOSED) == [
+        "no count for Almond Milk, Oat Milk, Soy Milk, Lactose Free, Coconut; told 2 of 2 staff"
+    ]
+
+    # Staff were told to order by hand. A count texted afterwards must not also order.
+    bot.clear()
+    reply = sms("full count", LOW_STOCK)
+    assert "Stock updated" in reply and "order" not in reply.lower()
+    assert app_module._still_needed(WEDNESDAY + timedelta(days=1)) is None
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED
+    assert app_module.chase_missing_count(final=True) == []  # closing twice texts nobody
+    assert bot == []
+
+
+def test_the_wait_for_a_count_ends_after_a_day_even_if_the_closing_text_never_ran(bot, sms):
+    app_module.run_weekly_order()  # stale
+    _backdate_runs(timedelta(hours=25))  # the process was down at Thursday 9am
+    bot.clear()
+
+    reply = sms("full count", LOW_STOCK)
+
+    assert "Stock updated" in reply and "order" not in reply.lower()
+    assert _to_supplier(bot) == []
+    # A reminder that runs late must not act either: no nag, and no order from the late count.
+    bot.clear()
+    assert app_module.chase_missing_count() == []
+    assert bot == []
+
+
+def test_a_late_reminder_does_not_nag_once_the_wait_is_over(bot):
+    app_module.run_weekly_order()  # stale, nothing counted
+    _backdate_runs(timedelta(hours=25))
+    bot.clear()
+
+    assert app_module.chase_missing_count() == []
+    assert bot == []
+    assert _run_details(app_module.OUTCOME_CHASED) == []
+
+
+def test_a_follow_up_that_reaches_nobody_says_so_in_the_run_log(bot, monkeypatch):
+    app_module.run_weekly_order()  # stale
+
+    def every_send_fails(to, body):
+        raise RuntimeError("twilio down")
+
+    monkeypatch.setattr(app_module, "send_sms", every_send_fails)
+    app_module.chase_missing_count()
+    _backdate_runs(timedelta(hours=24))
+    app_module.chase_missing_count(final=True)
+
+    assert _run_details(app_module.OUTCOME_CHASED)[0].endswith("reached 0 of 2 staff")
+    assert _run_details(app_module.OUTCOME_CLOSED)[0].endswith("told 0 of 2 staff")
+
+
+def test_no_reminder_when_nothing_is_waiting(bot):
+    assert app_module.chase_missing_count() == []  # no run yet this week
+
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    app_module.run_weekly_order()  # ordered
+    bot.clear()
+    assert app_module.chase_missing_count() == []
+    assert app_module.chase_missing_count(final=True) == []
+    assert bot == []
+
+
+def _follow_up_jobs():
+    """The booked follow-ups by id. The scheduler is not running in tests, so a re-booked
+    job is queued next to the old one instead of replacing it; the last one queued wins,
+    as it does once the scheduler starts."""
+    return {job.id: job for job in app_module.scheduler.get_jobs() if job.id.startswith("chase_count")}
+
+
+def _clear_follow_up_jobs():
+    while _follow_up_jobs():
+        for job_id in _follow_up_jobs():
+            app_module.scheduler.remove_job(job_id)
+
+
+def test_a_request_for_a_count_books_its_reminder_and_its_closing_text(bot):
+    _clear_follow_up_jobs()
+    app_module.run_weekly_order()  # stale: staff asked
+    request = app_module._open_request(WEDNESDAY)
+    jobs = _follow_up_jobs()
+
+    # Timed from the request, so "within 24 hours" in the first text is true whenever
+    # the request was made — 9:00 Wednesday, a late catch-up run, or a manual trigger.
+    assert jobs["chase_count"].trigger.run_date == request.at + timedelta(hours=4)
+    assert jobs["chase_count_final"].trigger.run_date == request.at + timedelta(hours=24)
+    # Only the second one closes the week.
+    assert jobs["chase_count"].kwargs == {}
+    assert jobs["chase_count_final"].kwargs == {"final": True}
+    assert jobs["chase_count_final"].misfire_grace_time is None  # late is fine, never dropped
+
+
+def test_nothing_is_booked_when_no_count_was_asked_for(bot):
+    _clear_follow_up_jobs()
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
+    assert _follow_up_jobs() == {}
+
+
+def test_a_restart_rebooks_the_follow_ups_for_an_open_request(bot):
+    app_module.run_weekly_order()  # stale
+    _clear_follow_up_jobs()  # the jobs lived in memory; the process restarted
+    _backdate_runs(timedelta(hours=30))  # and stayed down past the reminder and the deadline
+
+    app_module._schedule_follow_ups()
+    jobs = _follow_up_jobs()
+
+    assert "chase_count" not in jobs  # too late to remind
+    due_in = jobs["chase_count_final"].trigger.run_date - datetime.now(timezone.utc)
+    assert timedelta(0) < due_in <= timedelta(minutes=1)  # the closing text still goes, now
+
+
+def test_the_weekly_order_is_booked_for_wednesday_nine_melbourne_time():
+    job = {job.id: job for job in app_module.scheduler.get_jobs()}["weekly_order"]
+    fields = {field.name: str(field) for field in job.trigger.fields}
+
+    assert (fields["day_of_week"], fields["hour"], fields["minute"]) == ("wed", "9", "0")
+    assert str(job.trigger.timezone) == "Australia/Melbourne"
+    assert job.func is app_module.run_weekly_order and not job.args and not job.kwargs  # never forced
+    assert job.misfire_grace_time == 3 * 60 * 60  # a stalled process runs it late, not never
+    assert app_module.ORDER_WEEKDAY == 2  # the weekday the rest of the code calls order day
+
+
+def test_deadline_is_spoken_in_the_cafes_time():
+    from models import JobRun
+
+    def deadline(utc):
+        return app_module._deadline_text(JobRun(WEDNESDAY, app_module.OUTCOME_STALE, utc))
+
+    # Asked 9:00am Wednesday in Melbourne (23:00 UTC Tuesday, AEST)
+    assert deadline(datetime(2026, 5, 12, 23, 0, tzinfo=timezone.utc)) == "9:00am Thursday"
+    assert deadline(datetime(2026, 5, 13, 2, 30, tzinfo=timezone.utc)) == "12:30pm Thursday"
+    assert deadline(datetime(2026, 5, 13, 14, 5, tzinfo=timezone.utc)) == "12:05am Friday"
+    assert deadline(datetime(2026, 5, 13, 11, 45, tzinfo=timezone.utc)) == "9:45pm Thursday"
+
+
+def test_a_restart_inside_the_wait_still_gets_a_complete_count_ordered(bot):
+    """Asked at 9:00, the count completed at 3pm, and a restart killed the thread placing
+    the order. Startup must book the reminder (which places it), not only the close."""
+    app_module.run_weekly_order()  # stale
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)  # complete; nothing released it
+    _clear_follow_up_jobs()
+    _backdate_runs(timedelta(hours=6))
+    _backdate_stock(timedelta(minutes=5))
+    bot.clear()
+
+    app_module._schedule_follow_ups()
+    reminder = _follow_up_jobs()["chase_count"]
+
+    due_in = reminder.trigger.run_date - datetime.now(timezone.utc)
+    assert timedelta(0) < due_in <= timedelta(minutes=1)
+    reminder.func(*reminder.args, **reminder.kwargs)  # what the scheduler will run
+    assert len(_to_supplier(bot)) == 1
+
+
+def test_a_closing_job_left_over_from_an_earlier_request_does_not_close_a_new_one(bot):
+    app_module.run_weekly_order()  # stale, asked seconds ago
+    _clear_follow_up_jobs()
+    bot.clear()
+
+    assert app_module.chase_missing_count(final=True) == []  # a stale job fires early
+
+    assert bot == []  # the wait that staff were promised is not cut short
+    assert app_module._open_request(WEDNESDAY) is not None
+    assert _run_details(app_module.OUTCOME_CLOSED) == []
+    assert "chase_count_final" in _follow_up_jobs()  # and the right closing job is booked again
+
+
+def test_count_that_arrives_while_the_run_is_asking_for_it_still_gets_ordered(bot, monkeypatch):
+    """The 9:00 run reads the stock (nothing there), and while it is texting staff the
+    count lands. That text got "Stock updated" — no run was waiting yet. Without a
+    re-check the run logs "stale" over a complete count and no order ever goes."""
+    real_notify = app_module._notify_employees
+
+    def count_lands_mid_run(body):
+        sent = real_notify(body)
+        if "don't have a recent stock count" in body:
+            storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+        return sent
+
+    monkeypatch.setattr(app_module, "_notify_employees", count_lands_mid_run)
+
+    assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
+    assert len(_to_supplier(bot)) == 1
+    assert app_module._open_request(WEDNESDAY) is None
+
+
+def test_reminder_places_the_order_if_the_count_is_complete_but_it_never_went(bot):
+    """The release thread died (a restart) after the count completed the set."""
+    app_module.run_weekly_order()  # stale
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)  # complete, but nothing released it
+    bot.clear()
+
+    assert app_module.chase_missing_count() == []
+    assert len(_to_supplier(bot)) == 1
+    assert _run_details(app_module.OUTCOME_CHASED) == []  # it ordered; it did not nag
+
+
+def test_closing_always_ends_the_week_with_a_text_even_if_the_count_is_complete(bot, sms):
+    app_module.run_weekly_order()  # stale
+    _backdate_runs(timedelta(hours=25))  # the deadline has passed
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)  # arrived after it
+    bot.clear()
+
+    app_module.chase_missing_count(final=True)
+
+    assert _to_supplier(bot) == []  # too late to order automatically
+    assert {to for to, _ in bot} == set(STAFF)
+    assert bot[0][1].startswith("This week's milk order has NOT been placed")
+    assert "No stock count came in" not in bot[0][1]  # one did; it was late
+    assert app_module.run_weekly_order() == app_module.OUTCOME_SKIPPED  # the week is closed
+
+
+def test_follow_ups_use_the_delivery_rule_too(bot):
+    """A request made because the counts predate a delivery: the reminder must list those
+    items as still needed, not treat the recent-but-too-early counts as fine."""
+    storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_ORDERED
+    _backdate_runs(timedelta(days=3))
+    conn = storage._get_connection()
+    conn.execute("UPDATE job_runs SET run_date = ?", ((WEDNESDAY - timedelta(days=3)).isoformat(),))
+    conn.commit()
+    conn.close()
+    _backdate_stock(timedelta(days=2, hours=1))
+    assert app_module.run_weekly_order() == app_module.OUTCOME_STALE
+    bot.clear()
+
+    assert len(app_module.chase_missing_count()) == 5
+    assert "Almond Milk" in bot[0][1]
+    assert _to_supplier(bot) == []
+
+
+def test_forced_run_with_no_count_in_an_unhandled_week_still_asks_staff(bot):
+    """force only skips the guards against a second order. With nothing ordered this week
+    and no count, it must ask like any other run — not refuse silently."""
+    assert app_module.run_weekly_order(force=True) == app_module.OUTCOME_STALE
+    assert {to for to, _ in bot} == set(STAFF)
+    assert app_module._open_request(WEDNESDAY) is not None
 
 
 def test_sms_outside_a_waiting_week_only_records_stock(bot, sms):

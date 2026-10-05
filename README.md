@@ -11,16 +11,18 @@ Employee texts stock levels (SMS)
         ↓
 Claude AI parses the message → saves to local database
         ↓
-Wednesday 9:00 AM AEST (automatic)
+Wednesday 9:00 AM Melbourne time (automatic)
         ↓
-Claude AI checks stock, targets, season & order history
+Order calculated: target minus counted stock, plus the seasonal uplift
         ↓
 Texts the order to supplier
         ↓
 Texts a confirmation summary to all employees
 ```
 
-No human input required on ordering day — it runs fully automatically. The quantities are capped in code at what the stock arithmetic allows, so the AI step can trim an order but never inflate one.
+No human input required on ordering day — it runs fully automatically. The quantities are plain arithmetic from the targets in `config.py`; the AI only reads the staff texts, it does not decide what is ordered.
+
+**If no text has arrived from the system by 9:15 on a Wednesday, place the order by hand.** The Wednesday 9:00 run normally ends in a text to staff (the order summary, "no order needed", a request for a count, or "skipped, an order went out recently"), so silence means it did not run.
 
 ---
 
@@ -30,7 +32,8 @@ No human input required on ordering day — it runs fully automatically. The qua
 |-----------|-----------|
 | Web server / SMS webhook | Flask |
 | SMS (inbound + outbound) | Twilio |
-| AI parsing + ordering logic | Anthropic Claude (Haiku + Sonnet) |
+| Reading staff texts | Anthropic Claude (Haiku) |
+| Order quantities | Arithmetic in `order_calculator.py` (no AI) |
 | Database | SQLite |
 | Scheduling | APScheduler |
 
@@ -41,8 +44,8 @@ No human input required on ordering day — it runs fully automatically. The qua
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/your-username/creme.git
-cd creme
+git clone https://github.com/konlenka/supplier.agent.git
+cd supplier.agent
 ```
 
 ### 2. Install dependencies
@@ -107,8 +110,9 @@ Copy the `https://xxxx.ngrok.io` URL. In your Twilio phone number settings, set:
 1. Push this repo to GitHub
 2. Go to [railway.app](https://railway.app) and create a new project from your GitHub repo
 3. Add all your `.env` variables in Railway's **Variables** tab
-4. Railway auto-detects Flask and deploys — you'll get a permanent public URL
-5. Update your Twilio webhook URL to the Railway URL: `https://your-app.railway.app/sms`
+4. Railway starts the app with the command in `Procfile` (`python app.py` — the weekly job only runs when the app is started this way) and gives you a permanent public URL
+5. Add a volume mounted at the app's `data/` folder. Without it every redeploy wipes the stock counts, the order history and the record of this week's order
+6. Update your Twilio webhook URL to the Railway URL: `https://your-app.railway.app/sms`
 
 **Cost:** ~$0.50–$2/month (well within Railway's $5/month Hobby credit).
 
@@ -154,7 +158,14 @@ The system replies with a confirmation of what it recorded.
 
 A message that doesn't contain a recognisable stock count is not recorded; the sender gets the format back.
 
-If any item has no count from the last 3 days when Wednesday 9am comes, the system texts employees naming the items it needs and holds the order. The order goes out as soon as every item has a fresh count.
+If any item has no count from the last 3 days when Wednesday 9am comes, the system texts employees naming the items it needs and holds the order. The order goes out as soon as every item has a fresh count. If the count still hasn't come, it reminds employees 4 hours after asking (1pm Wednesday for the normal run). 24 hours after asking (9am Thursday) it closes the week: it says the order has not been placed and to order by hand. After that a count only records stock; it no longer places an order, so an order placed by hand is never doubled by a late text.
+
+The system never orders twice for one shortfall. It assumes a delivery takes `DELIVERY_DAYS` (2, in `config.py` — **an assumption, confirm it with the supplier**) to arrive:
+
+- If an order went out less than that long ago, a run places no order and texts employees that it was skipped.
+- A count taken before that delivery was due doesn't count as fresh, because it can't include the delivery. The system asks employees to count again once the delivery has arrived.
+
+In a normal week neither applies: the next count comes days after the last delivery.
 
 If the job fails before the order is sent, employees get a text saying nothing went to the supplier, so the order can be placed by hand. If the send itself errors, the text says the order may not have reached the supplier and to check with them first — the system won't re-send it on its own.
 
@@ -176,7 +187,7 @@ Adjust these values in [config.py](config.py) to change what gets ordered.
 
 ## Seasonal adjustments
 
-The ordering agent automatically adjusts quantities based on demand:
+The order calculation adjusts quantities for the season. The uplift is applied to the shortfall (target minus stock), not to the target:
 
 | Condition | Adjustment |
 |-----------|-----------|
