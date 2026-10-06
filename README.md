@@ -136,7 +136,7 @@ Run these in PowerShell, in this folder.
    ```
    fly volumes create creme_data --region syd --size 1 --yes
    ```
-5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step. **For the first deploy, set `SUPPLIER_PHONE_NUMBER` and `EMPLOYEE_PHONE_NUMBERS` to your own mobile**, so the tests in steps 10 and 11 text nobody else. Keep the single quotes: without them PowerShell cuts a value short at a `$` or `;`:
+5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step. **For the first deploy, set `SUPPLIER_PHONE_NUMBER`, `EMPLOYEE_PHONE_NUMBERS` and `APPROVER_PHONE_NUMBER` to your own mobile**, so the tests in steps 10 and 11 text nobody else. Keep the single quotes: without them PowerShell cuts a value short at a `$` or `;`:
    ```
    fly secrets set 'TWILIO_ACCOUNT_SID=...' 'TWILIO_AUTH_TOKEN=...' 'TWILIO_PHONE_NUMBER=...' 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...' 'ANTHROPIC_API_KEY=...' 'TRIGGER_KEY=...' 'APPROVER_PHONE_NUMBER=...'
    ```
@@ -156,11 +156,11 @@ Run these in PowerShell, in this folder.
    fly logs
    ```
 10. Prove a text gets in. **Not on a Wednesday:** after 9:00 on a Wednesday a freshly started bot asks for a count straight away, and the next count it gets sends an order (or an approval request). From your mobile, text a stock count to the Twilio number. A reply listing the counts proves that Twilio reached the bot, the auth token is right and the Anthropic key works. No reply, with "Invalid Twilio signature" in `fly logs`, means the request was refused: stop and fix that first.
-11. Prove a text gets out. With the supplier and staff numbers still set to your own mobile, run the manual trigger (see Testing, below). The order, or the approval request if the approver is set, should arrive on your phone. Only this proves the account SID, the Twilio number and outbound sending.
+11. Prove a text gets out. With all three numbers still set to your own mobile, run the manual trigger (see Testing, below). The approval request should arrive on your phone; reply YES and the order and the staff summary should follow. Only this proves the account SID, the Twilio number and outbound sending.
 12. Clear the test and go live. Steps 10 and 11 leave a made-up count and a test order in the database, and the bot would treat them as real: it would skip an order for the next two days and work the next one out from the made-up count. Delete the database, then set the real numbers (in that order: setting a secret restarts the bot, and the restart recreates the database empty), and have staff text a true count before Wednesday:
     ```
     fly ssh console -C "rm /app/data/stock.db"
-    fly secrets set 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...'
+    fly secrets set 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...' 'APPROVER_PHONE_NUMBER=...'
     ```
     Only ever delete the database before go-live. After that it holds the café's order history and the record of the current week.
 
