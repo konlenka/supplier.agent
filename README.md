@@ -106,16 +106,71 @@ Copy the `https://xxxx.ngrok.io` URL. In your Twilio phone number settings, set:
 
 ---
 
-## Deployment (Railway)
+## Deployment (Fly.io, Sydney)
 
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) and create a new project from your GitHub repo
-3. Add all your `.env` variables in Railway's **Variables** tab
-4. Railway starts the app with the command in `Procfile` (`python app.py` — the weekly job only runs when the app is started this way) and gives you a permanent public URL
-5. Add a volume mounted at the app's `data/` folder. Without it every redeploy wipes the stock counts, the order history and the record of this week's order
-6. Update your Twilio webhook URL to the Railway URL: `https://your-app.railway.app/sms`
+The bot runs as one always-on container on [Fly.io](https://fly.io) in the Sydney region, with its database on a persistent volume. The setup is in `Dockerfile` and `fly.toml`. (It ran on Railway until May 2026; Railway has no Australian region.)
 
-**Cost:** ~$0.50–$2/month (well within Railway's $5/month Hobby credit).
+Three things must stay true, and `tests/test_deploy_config.py` checks the ones a file can show:
+
+- **Exactly one machine.** The weekly job runs inside the app. Two machines are two bots and the supplier gets every order twice. Fly creates two by default, so every deploy uses `--ha=false`.
+- **Never stopped when idle.** A sleeping machine sleeps through 9:00 on Wednesday.
+- **`data/` on the volume.** Off it, every deploy wipes the stock counts, the order history and the record of this week's order.
+
+### First deploy
+
+Run these in PowerShell, in this folder.
+
+1. Install the Fly command line, then close and reopen the terminal:
+   ```
+   iwr https://fly.io/install.ps1 -useb | iex
+   ```
+2. Create the account (or log in) and add a card in the dashboard:
+   ```
+   fly auth signup
+   ```
+3. Create the app. If the name is taken, pick another and change `app` in `fly.toml` to match:
+   ```
+   fly apps create creme-supplier-bot
+   ```
+4. Create the volume for the database:
+   ```
+   fly volumes create creme_data --region syd --size 1 --yes
+   ```
+5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step:
+   ```
+   fly secrets set TWILIO_ACCOUNT_SID=... TWILIO_AUTH_TOKEN=... TWILIO_PHONE_NUMBER=... SUPPLIER_PHONE_NUMBER=... EMPLOYEE_PHONE_NUMBERS=...,... ANTHROPIC_API_KEY=... TRIGGER_KEY=... APPROVER_PHONE_NUMBER=...
+   ```
+6. Deploy. The build runs the test suite inside the image and stops if it fails:
+   ```
+   fly deploy --ha=false
+   ```
+7. Check there is exactly one machine. If it shows two, run `fly scale count 1`:
+   ```
+   fly scale show
+   ```
+8. In Twilio, set the number's **"A message comes in"** to `https://creme-supplier-bot.fly.dev/sms` (POST).
+9. Watch it start. You should see "Scheduler started":
+   ```
+   fly logs
+   ```
+
+### After that
+
+| To | Run |
+|---|---|
+| Deploy a change | `fly deploy --ha=false` |
+| See what it is doing | `fly logs` |
+| Change a secret (restarts the bot) | `fly secrets set NAME=value` |
+| End the approval trial | `fly secrets unset APPROVER_PHONE_NUMBER` |
+| Switch the bot off | `fly scale count 0 --yes` |
+| Switch it back on | `fly scale count 1 --yes`, then `fly scale show` |
+| Roll back | `fly releases --image`, then `fly deploy --ha=false --image <the previous image>` |
+
+A deploy or a secret change restarts the bot. It picks up where it left off, but avoid doing it between 9:00 Wednesday and 9:00 Thursday, when an order may be waiting on a count or an approval.
+
+Fly snapshots the volume daily and keeps five days. `fly volumes snapshots list <volume id>` shows them.
+
+**Cost:** not yet measured on Fly. Expect a few US dollars a month for the machine and volume; check Fly's pricing page.
 
 ---
 
@@ -188,7 +243,7 @@ The reply is matched against a fixed list of words. No AI reads it.
 
 **The approver should not reply STOP or CANCEL.** The system reads those as a no, but Twilio may also treat them as an unsubscribe and block every later text to that number until they text START. (Twilio's behaviour here has not been tested on this account.)
 
-To end the trial, remove `APPROVER_PHONE_NUMBER` from the environment (Railway → Variables) and restart: orders then go straight to the supplier as before. Do it when no order is waiting for approval. If one is waiting, it is cancelled at the restart, not sent, and staff are told to order by hand.
+To end the trial, remove `APPROVER_PHONE_NUMBER` from the environment (`fly secrets unset APPROVER_PHONE_NUMBER`, which restarts the bot): orders then go straight to the supplier as before. Do it when no order is waiting for approval. If one is waiting, it is cancelled at the restart, not sent, and staff are told to order by hand.
 
 ---
 
@@ -230,5 +285,7 @@ See [.env.example](.env.example) for a full template.
 |---------|---------|
 | Anthropic Claude API | ~$0.18 |
 | Twilio (number + SMS) | ~$2.75 |
-| Railway hosting | ~$0.50–2.00 |
-| **Total** | **~$3.50–5/month** |
+| Fly.io hosting (Sydney) | not yet measured |
+| **Total** | **not yet measured** |
+
+The Anthropic and Twilio figures are estimates from April 2026 with a US number; an Australian number costs more.

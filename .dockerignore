@@ -1,0 +1,15 @@
+# Secrets and client data never go into the image. In production the secrets come from
+# `fly secrets` and the database lives on the mounted volume.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db.bak
+
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/

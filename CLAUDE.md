@@ -77,6 +77,9 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 | The process is restarting at 9:00 Wednesday and the week's run is dropped | `test_missed_run_is_detected_only_on_order_day_after_nine` |
 | Bottle items (lactose free, coconut) shown as boxes in the staff summary | `test_confirmation_totals_use_the_unit_staff_count_in` |
 | `/trigger` reachable with a key that is in the code | `test_trigger_is_off_without_a_configured_key` |
+| The host stops an idle machine and it sleeps through 9:00 Wednesday; the database is off the volume and a deploy wipes the week's record; the app is started in a way that never books the weekly job; traffic goes to the wrong port | `tests/test_deploy_config.py` |
+| Two machines run at once (Fly's default on a first deploy): two bots, two databases, and the supplier gets every order twice | No test can see this. `fly deploy --ha=false`, then `fly scale show` |
+| A rebuild months later pulls a dependency version nobody tested (APScheduler 4 has a different API) | `test_every_dependency_is_pinned`; the image build runs the suite |
 | With approval on, an order reaches the supplier without a yes: straight from the run, from a re-run or forced run while one is waiting, or from a count that completes the wait | `test_with_approval_on_the_order_goes_to_the_boss_and_not_the_supplier`, `test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing`, `test_a_count_that_completes_the_wait_goes_to_the_boss_and_staff_are_told_so` |
 | A yes releases something other than what the approver saw (re-worked from a later count), or releases it twice | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order` |
 | A yes from the wrong person, a day late, or for a request that never reached the approver sends an order | `test_a_yes_from_a_staff_number_is_not_an_approval`, `test_a_yes_after_the_wait_is_over_sends_nothing_and_closes_the_week`, `test_a_request_that_never_reached_the_boss_cannot_be_approved`, `test_next_weeks_request_replaces_one_the_boss_never_answered` |
@@ -101,20 +104,26 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 
 ## How to run, test and deploy (routines)
 - Run: `python app.py` (the scheduler only starts this way, not under gunicorn or `flask run`).
-  `Procfile` carries the same command for Railway; a start command set in the Railway dashboard
-  overrides it, so keep the two the same.
+  The `Dockerfile`'s `CMD` is that command. `Procfile` is left over from Railway and unused on Fly.
 - Unit tests: `python -m pytest -q` — no SMS, no model calls, throwaway database
 - `python dry_run.py` calls the real Claude API and writes a test row to the real `data/stock.db`
 - `python trigger_order.py` and `/trigger?key=…` send **real SMS** to the supplier and staff
-- Deploy: Railway (see Notion → Services & Accounts → Railway for how it is wired). Env vars are in
-  Railway's Variables tab; `TRIGGER_KEY` must be set there or `/trigger` answers 403. Rollback: redeploy
-  the previous deployment in Railway.
+- Deploy: Fly.io, Sydney (`fly.toml`, `Dockerfile`; steps in README → Deployment). Always
+  `fly deploy --ha=false`, then `fly scale show` must say one machine. The image build runs the suite
+  and stops the deploy if it fails. Secrets are set with `fly secrets set`; `TRIGGER_KEY` must be set
+  or `/trigger` answers 403. Rollback: `fly releases --image`, then
+  `fly deploy --ha=false --image <the previous image>`. Off switch: `fly scale count 0 --yes`.
+  **Not yet deployed there (6 Oct 2026):** the files are written and tested locally on Python 3.13
+  with the pinned versions, but no image has been built and nothing has run on Fly. Railway was
+  switched off when its trial ended on 4 May 2026.
+- Dependencies are pinned in `requirements.txt` to the versions the suite passes with. Raise a pin on
+  purpose, run the suite, then deploy; don't loosen them back to ranges.
 - Scheduled jobs, in-process (APScheduler), Australia/Melbourne: the order run Wednesday 9:00am. When
   a run has to ask for a count it books two follow-ups timed from that request: a reminder 4 hours
   later and the closing text 24 hours later (1:00pm Wednesday and 9:00am Thursday for the normal
   run). They live in memory, so startup re-books them for a request that is still open; a restart
   across the 4-hour mark drops the reminder, never the closing text. Every run and follow-up is
-  written to the `job_runs` table and to stdout (Railway logs). An order sent for approval books
+  written to the `job_runs` table and to stdout (`fly logs`). An order sent for approval books
   the same pair for the approver (`chase_approval`), timed from when they were asked and re-booked
   at startup the same way. Every approval request, its answer and the approver's words are in the
   `order_approvals` table.
@@ -142,11 +151,12 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 - Before merging to main or going live: run the `schneier` skill. Before handing over: `hightower`.
 
 ## Handover (for the next person, or the client)
-- Accounts (Railway, Twilio, Anthropic, GitHub `konlenka/supplier.agent`) are in Christian's name;
-  status lives in Notion → Crème Handover.
-- Where secrets live: `.env` locally, Railway Variables in production.
-- What only works because of Christian's setup: whether `data/` sits on a persistent volume, the port
-  (`app.py` listens on 5000) and any start-command override are set in the Railway dashboard, not in
-  this repo. Without the volume a redeploy wipes stock, order history and the once-a-week guard.
+- Accounts (Fly.io, Twilio, Anthropic, GitHub `konlenka/supplier.agent`) are in Christian's name, at
+  the owner's request (6 Oct 2026: the owner does not want to open accounts). The café can have its
+  data and its phone number on request. Status lives in Notion → Crème Handover.
+- Where secrets live: `.env` locally, `fly secrets` in production.
+- The volume, the port (5000), the region and the start command are all in this repo now
+  (`fly.toml`, `Dockerfile`). What is not in the repo: the number of machines. That is set by how
+  the deploy command is run, so check it after every deploy.
 - The supplier's first name is written into `format_order_message`. A change of supplier or rep is a
   code change, not a setting.
