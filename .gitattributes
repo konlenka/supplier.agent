@@ -1,0 +1,5 @@
+# Files the Linux image build reads keep Unix line endings on a Windows checkout.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+fly.toml text eol=lf
+requirements.txt text eol=lf
