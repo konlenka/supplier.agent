@@ -136,7 +136,7 @@ Run these in PowerShell, in this folder.
    ```
    fly volumes create creme_data --region syd --size 1 --yes
    ```
-5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step. Keep the single quotes: without them PowerShell cuts a value short at a `$` or `;`:
+5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step. **For the first deploy, set `SUPPLIER_PHONE_NUMBER` and `EMPLOYEE_PHONE_NUMBERS` to your own mobile**, so the tests in steps 10 and 11 text nobody else. Keep the single quotes: without them PowerShell cuts a value short at a `$` or `;`:
    ```
    fly secrets set 'TWILIO_ACCOUNT_SID=...' 'TWILIO_AUTH_TOKEN=...' 'TWILIO_PHONE_NUMBER=...' 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...' 'ANTHROPIC_API_KEY=...' 'TRIGGER_KEY=...' 'APPROVER_PHONE_NUMBER=...'
    ```
@@ -155,7 +155,14 @@ Run these in PowerShell, in this folder.
    ```
    fly logs
    ```
-10. Prove a text gets in and out. From a staff phone, text a stock count to the Twilio number. A reply listing the counts means Twilio reached the bot, the signature check passed and the secrets are right. No reply, with "Invalid Twilio signature" in `fly logs`, means the request was refused: stop and fix that before relying on the bot.
+10. Prove a text gets in. **Not on a Wednesday:** after 9:00 on a Wednesday a freshly started bot asks for a count straight away, and the next count it gets sends an order (or an approval request). From your mobile, text a stock count to the Twilio number. A reply listing the counts proves that Twilio reached the bot, the auth token is right and the Anthropic key works. No reply, with "Invalid Twilio signature" in `fly logs`, means the request was refused: stop and fix that first.
+11. Prove a text gets out. With the supplier and staff numbers still set to your own mobile, run the manual trigger (see Testing, below). The order, or the approval request if the approver is set, should arrive on your phone. Only this proves the account SID, the Twilio number and outbound sending.
+12. Clear the test and go live. Steps 10 and 11 leave a made-up count and a test order in the database, and the bot would treat them as real: it would skip an order for the next two days and work the next one out from the made-up count. Delete the database, then set the real numbers (in that order: setting a secret restarts the bot, and the restart recreates the database empty), and have staff text a true count before Wednesday:
+    ```
+    fly ssh console -C "rm /app/data/stock.db"
+    fly secrets set 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...'
+    ```
+    Only ever delete the database before go-live. After that it holds the café's order history and the record of the current week.
 
 ### After that
 
@@ -163,7 +170,7 @@ Run these in PowerShell, in this folder.
 |---|---|
 | Deploy a change | `fly deploy --ha=false` |
 | See what it is doing | `fly logs` |
-| Change a secret (restarts the bot) | `fly secrets set NAME=value` |
+| Change a secret (restarts the bot) | `fly secrets set 'NAME=value'` |
 | End the approval trial | `fly secrets unset APPROVER_PHONE_NUMBER` |
 | Switch the bot off | `fly scale count 0 --yes` (the volume and its data stay) |
 | Switch it back on | `fly deploy --ha=false`, then `fly scale show` and `fly volumes list`: one machine, the same one volume, attached |
@@ -171,7 +178,7 @@ Run these in PowerShell, in this folder.
 
 A deploy or a secret change restarts the bot. It picks up where it left off, but avoid doing it between 9:00 Wednesday and 9:00 Thursday, when an order may be waiting on a count or an approval.
 
-Switching off and back on has not been rehearsed on Fly yet. Do it once before the café relies on the bot, and text a count afterwards to confirm the stock counts are still there. If a second, empty volume appears, the bot has lost its memory of the week: switch it off again and sort that out first.
+Switching off and back on has not been rehearsed on Fly yet. Do it once before the café relies on the bot, not on a Wednesday, and note the volume's ID in `fly volumes list` before and after: the same ID, attached to the machine, is the proof the data is still there. Switching back on deploys the code in this folder, so be on `main` when you do it. If a second, empty volume appears, the bot has lost its memory of the week: switch it off again and sort that out first.
 
 Fly snapshots the volume daily and keeps five days. `fly volumes snapshots list <volume id>` shows them.
 
@@ -198,12 +205,12 @@ This fires the full order flow immediately — sends real SMS to supplier and em
 On the deployed server the same job runs from `https://creme-supplier-bot.fly.dev/trigger`, with the key sent as a header so it is not written to the logs:
 
 ```
-curl.exe -H "X-Trigger-Key: <TRIGGER_KEY>" https://creme-supplier-bot.fly.dev/trigger
+curl.exe -H 'X-Trigger-Key: <TRIGGER_KEY>' https://creme-supplier-bot.fly.dev/trigger
 ```
 
 The key also works as `?key=` in the address, but then it is logged with the request; if that happens, change `TRIGGER_KEY`.
 If this week's order (Wednesday to Tuesday) is already handled the job skips rather than ordering twice;
-add `&force=1` to send anyway. A forced send within 10 minutes of the last order is refused.
+add `?force=1` to the address to send anyway. A forced send within 10 minutes of the last order is refused.
 
 ### Run unit tests
 

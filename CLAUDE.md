@@ -121,6 +121,12 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   **Not yet deployed there (6 Oct 2026):** the files are written and tested locally on Python 3.13
   with the pinned versions, but no image has been built and nothing has run on Fly. Railway was
   switched off when its trial ended on 4 May 2026.
+- A count texted to a deployed bot is real stock, and a trigger run is a real order: there is no
+  test mode. For the first deploy the supplier and staff numbers are set to Christian's mobile, the
+  tests are run on a day other than Wednesday, and the database is deleted before the real numbers
+  go in (README → First deploy, steps 10 to 12). After go-live the database is never deleted.
+- Deploy-config mutation check, 6 Oct: 33 deliberate breakages of `fly.toml`, the `Dockerfile`,
+  `.dockerignore` and the lines of code they depend on, each caught by `tests/test_deploy_config.py`.
 - The packages the code imports are pinned in `requirements.txt` to the versions the suite passes
   with. Raise a pin on purpose, run the suite, then deploy; don't loosen them back to ranges. What
   those packages pull in, and the `python:3.13-slim` base image, are not pinned: the suite running
