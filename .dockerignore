@@ -8,8 +8,8 @@ data/
 *.db.bak
 
 .git/
-__pycache__/
-*.pyc
-.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
 venv/
 .venv/

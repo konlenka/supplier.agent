@@ -1714,3 +1714,97 @@ def test_with_no_approver_set_nothing_is_held(bot):
     assert app_module.run_weekly_order() == app_module.OUTCOME_ORDERED
     assert len(_to_supplier(bot)) == 1
     assert _approvals() == []
+
+
+# --- Behind the host's proxy: who is let in, and what reaches the logs ---
+
+PUBLIC_HOST = "creme-supplier-bot.fly.dev"
+STRANGER = "+61499999999"
+
+
+@pytest.fixture
+def twilio(bot, monkeypatch):
+    """Real signature checking, with a known auth token. Returns a function that posts to /sms
+    the way the host's proxy hands a Twilio request to the app: plain HTTP on the inside, the
+    public host name, and `X-Forwarded-Proto: https`. Twilio signs the public https URL."""
+    import sms as sms_module
+    from twilio.request_validator import RequestValidator
+
+    monkeypatch.setattr(sms_module, "TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = app_module.app.test_client()
+
+    def post(signed_with="test-auth-token", forwarded_proto="https"):
+        params = {"From": STRANGER, "Body": "hello"}
+        signature = RequestValidator(signed_with).compute_signature(f"https://{PUBLIC_HOST}/sms", params)
+        headers = {"X-Twilio-Signature": signature}
+        if forwarded_proto:
+            headers["X-Forwarded-Proto"] = forwarded_proto
+        return client.post("/sms", data=params, headers=headers, base_url=f"http://{PUBLIC_HOST}")
+
+    return post
+
+
+def test_a_twilio_request_arriving_through_the_hosts_proxy_is_accepted(twilio):
+    response = twilio()
+
+    assert response.status_code == 200
+    assert "not authorised" in response.get_data(as_text=True)  # let in, then judged on its sender
+
+
+def test_a_request_signed_with_another_key_is_refused(twilio):
+    assert twilio(signed_with="someone-elses-token").status_code == 403
+
+
+def test_the_signature_only_matches_if_the_proxy_says_the_request_came_by_https(twilio):
+    """What the first real text on a new host has to prove: if its proxy does not send
+    X-Forwarded-Proto, every staff text is refused and the bot never hears a count."""
+    assert twilio(forwarded_proto=None).status_code == 403
+
+
+def test_with_no_auth_token_set_every_incoming_text_is_refused(twilio, monkeypatch):
+    """An empty token signs like any other key. If the secret is missing on the host, anyone
+    who knows the URL could otherwise post a stock count, or an approver's yes."""
+    import sms as sms_module
+
+    monkeypatch.setattr(sms_module, "TWILIO_AUTH_TOKEN", "")
+
+    assert twilio(signed_with="").status_code == 403
+
+
+def test_phone_numbers_are_not_written_to_the_logs(bot, sms, monkeypatch, caplog):
+    """Logs leave the machine for the host's log pipeline. A staff member's mobile number is
+    personal information; the last three digits are enough to tell who a line is about."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    sms("full count", LOW_STOCK)  # "Stock report saved from …"
+    sms("hello", LOW_STOCK, sender=STRANGER)  # "SMS from unknown number …"
+
+    def fails(to, body):
+        raise RuntimeError("twilio is down")
+
+    monkeypatch.setattr(app_module, "send_sms", fails)
+    app_module._notify_employees("hello")  # "Failed to send SMS to employee …"
+
+    for number in (*STAFF, STRANGER):
+        assert number not in caplog.text
+    assert "***002" in caplog.text and "***999" in caplog.text
+
+
+def test_the_sms_module_logs_who_it_texted_without_the_number(monkeypatch, caplog):
+    import logging
+
+    import sms as sms_module
+
+    class FakeTwilio:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                return type("Message", (), {"sid": "SM123"})()
+
+    monkeypatch.setattr(sms_module, "get_twilio_client", lambda: FakeTwilio)
+    caplog.set_level(logging.INFO)
+
+    assert sms_module.send_sms(SUPPLIER, "the order") == "SM123"
+
+    assert SUPPLIER not in caplog.text and "***001" in caplog.text

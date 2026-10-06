@@ -1,7 +1,8 @@
 # Fly.io config for the Creme Cafe supplier bot. How to deploy: README -> Deployment.
 #
-# First deploy must be `fly deploy --ha=false`. Fly's default is two machines for
-# redundancy; two machines are two bots, and the supplier gets every order twice.
+# Every deploy is `fly deploy --ha=false`, then `fly scale show` must say one machine.
+# Fly can add a spare machine for redundancy; two machines are two bots, each with its own
+# database, and the supplier gets every order twice.
 
 app = "creme-supplier-bot"    # must be unique across Fly; change it here if the name is taken
 primary_region = "syd"        # Sydney: the bot stores staff phone numbers
@@ -17,6 +18,11 @@ primary_region = "syd"        # Sydney: the bot stores staff phone numbers
   auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
+
+# Fly's default gives up on a machine that crashes ten times in five minutes and leaves
+# one that exits cleanly stopped. This bot has no business being stopped: always restart.
+[[restart]]
+  policy = "always"
 
 # Stock counts, order history, orders waiting for approval and the record of this week's
 # order. Off this volume, every deploy wipes them and the next run can order again.

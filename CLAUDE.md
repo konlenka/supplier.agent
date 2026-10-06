@@ -78,7 +78,10 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 | Bottle items (lactose free, coconut) shown as boxes in the staff summary | `test_confirmation_totals_use_the_unit_staff_count_in` |
 | `/trigger` reachable with a key that is in the code | `test_trigger_is_off_without_a_configured_key` |
 | The host stops an idle machine and it sleeps through 9:00 Wednesday; the database is off the volume and a deploy wipes the week's record; the app is started in a way that never books the weekly job; traffic goes to the wrong port | `tests/test_deploy_config.py` |
-| Two machines run at once (Fly's default on a first deploy): two bots, two databases, and the supplier gets every order twice | No test can see this. `fly deploy --ha=false`, then `fly scale show` |
+| Two machines run at once (Fly can add a spare for redundancy): two bots, two databases, and the supplier gets every order twice | No test can see this. `fly deploy --ha=false`, then `fly scale show` |
+| The machine crashes on start, or exits, and Fly's default restart policy leaves it stopped | `test_a_machine_that_exits_is_always_started_again` |
+| `TWILIO_AUTH_TOKEN` is missing on the host and a request signed with an empty key is accepted; or the host's proxy does not say the request came by https and every staff text is refused | `test_with_no_auth_token_set_every_incoming_text_is_refused`, `test_a_twilio_request_arriving_through_the_hosts_proxy_is_accepted`, `test_the_signature_only_matches_if_the_proxy_says_the_request_came_by_https`. Whether Fly's proxy sends what the check needs is only proven by the first real text |
+| Staff or supplier phone numbers written to logs that leave the machine | `test_phone_numbers_are_not_written_to_the_logs`, `test_the_sms_module_logs_who_it_texted_without_the_number` |
 | A rebuild months later pulls a dependency version nobody tested (APScheduler 4 has a different API) | `test_every_dependency_is_pinned`; the image build runs the suite |
 | With approval on, an order reaches the supplier without a yes: straight from the run, from a re-run or forced run while one is waiting, or from a count that completes the wait | `test_with_approval_on_the_order_goes_to_the_boss_and_not_the_supplier`, `test_another_run_while_waiting_for_the_boss_asks_and_orders_nothing`, `test_a_count_that_completes_the_wait_goes_to_the_boss_and_staff_are_told_so` |
 | A yes releases something other than what the approver saw (re-worked from a later count), or releases it twice | `test_yes_sends_the_supplier_the_order_the_boss_was_shown`, `test_a_second_yes_does_not_send_a_second_order` |
@@ -107,17 +110,27 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   The `Dockerfile`'s `CMD` is that command. `Procfile` is left over from Railway and unused on Fly.
 - Unit tests: `python -m pytest -q` — no SMS, no model calls, throwaway database
 - `python dry_run.py` calls the real Claude API and writes a test row to the real `data/stock.db`
-- `python trigger_order.py` and `/trigger?key=…` send **real SMS** to the supplier and staff
+- `python trigger_order.py` and `/trigger` send **real SMS** to the supplier and staff. Send the
+  key as the `X-Trigger-Key` header; as `?key=` it is written to the logs with the request
 - Deploy: Fly.io, Sydney (`fly.toml`, `Dockerfile`; steps in README → Deployment). Always
   `fly deploy --ha=false`, then `fly scale show` must say one machine. The image build runs the suite
   and stops the deploy if it fails. Secrets are set with `fly secrets set`; `TRIGGER_KEY` must be set
   or `/trigger` answers 403. Rollback: `fly releases --image`, then
-  `fly deploy --ha=false --image <the previous image>`. Off switch: `fly scale count 0 --yes`.
+  `fly deploy --ha=false --image <the previous image>`. Off switch: `fly scale count 0 --yes`; back
+  on with `fly deploy --ha=false`, then check one machine and the same one volume. Not rehearsed yet.
   **Not yet deployed there (6 Oct 2026):** the files are written and tested locally on Python 3.13
   with the pinned versions, but no image has been built and nothing has run on Fly. Railway was
   switched off when its trial ended on 4 May 2026.
-- Dependencies are pinned in `requirements.txt` to the versions the suite passes with. Raise a pin on
-  purpose, run the suite, then deploy; don't loosen them back to ranges.
+- The packages the code imports are pinned in `requirements.txt` to the versions the suite passes
+  with. Raise a pin on purpose, run the suite, then deploy; don't loosen them back to ranges. What
+  those packages pull in, and the `python:3.13-slim` base image, are not pinned: the suite running
+  inside the image build is the guard for them.
+- Logs go to Fly's log pipeline, and where that keeps them is not documented, so phone numbers are
+  logged as their last three digits (`sms.mask_phone`). Not covered: an error message from Twilio
+  can quote a number, and the order itself (no personal data) is logged in full.
+- Open before the café relies on it (build protocol §8): nobody is alerted if the machine is down
+  or a run fails before it can text staff, beyond "no text by 9:15 means order by hand"; and the only
+  off switch is a `fly` command, which the café cannot run. Fly.io is not yet in thelo's tool matrix.
 - Scheduled jobs, in-process (APScheduler), Australia/Melbourne: the order run Wednesday 9:00am. When
   a run has to ask for a count it books two follow-ups timed from that request: a reminder 4 hours
   later and the closing text 24 hours later (1:00pm Wednesday and 9:00am Thursday for the normal

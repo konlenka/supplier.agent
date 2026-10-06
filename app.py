@@ -28,7 +28,7 @@ from config import (
 )
 from models import Approval, JobRun, OrderLine, StockLevel
 from order_calculator import calculate_order, format_order_lines, format_order_message
-from sms import send_sms, validate_twilio_request
+from sms import mask_phone, send_sms, validate_twilio_request
 from stock_parser import format_confirmation, parse_stock_sms
 
 logging.basicConfig(
@@ -135,7 +135,7 @@ def incoming_sms():
 
     # Check employee allowlist
     if from_number not in EMPLOYEE_PHONE_NUMBERS:
-        logger.warning("SMS from unknown number: %s", from_number)
+        logger.warning("SMS from unknown number: %s", mask_phone(from_number))
         resp = MessagingResponse()
         resp.message("Sorry, you are not authorised to report stock levels.")
         return str(resp)
@@ -156,7 +156,7 @@ def incoming_sms():
 
     # Save to database
     storage.save_stock_report(from_number, body, parsed)
-    logger.info("Stock report saved from %s: %s", from_number, parsed)
+    logger.info("Stock report saved from %s: %s", mask_phone(from_number), parsed)
 
     # If the order job is waiting on a count, either place the order now or say what is
     # still missing — staff were told the order goes out once the count is in.
@@ -331,7 +331,7 @@ def _notify_employees(body: str) -> int:
             send_sms(phone, body)
             sent += 1
         except Exception:
-            logger.exception("Failed to send SMS to employee %s", phone)
+            logger.exception("Failed to send SMS to employee %s", mask_phone(phone))
     return sent
 
 

@@ -112,8 +112,8 @@ The bot runs as one always-on container on [Fly.io](https://fly.io) in the Sydne
 
 Three things must stay true, and `tests/test_deploy_config.py` checks the ones a file can show:
 
-- **Exactly one machine.** The weekly job runs inside the app. Two machines are two bots and the supplier gets every order twice. Fly creates two by default, so every deploy uses `--ha=false`.
-- **Never stopped when idle.** A sleeping machine sleeps through 9:00 on Wednesday.
+- **Exactly one machine.** The weekly job runs inside the app. Two machines are two bots and the supplier gets every order twice. Fly can add a spare machine for redundancy, so every deploy uses `--ha=false` and is followed by a check.
+- **Never stopped.** A machine that is asleep, or that crashed and was not restarted, sleeps through 9:00 on Wednesday.
 - **`data/` on the volume.** Off it, every deploy wipes the stock counts, the order history and the record of this week's order.
 
 ### First deploy
@@ -124,7 +124,7 @@ Run these in PowerShell, in this folder.
    ```
    iwr https://fly.io/install.ps1 -useb | iex
    ```
-2. Create the account (or log in) and add a card in the dashboard:
+2. Create the account and add a card in the dashboard (`fly auth login` if the account already exists):
    ```
    fly auth signup
    ```
@@ -136,23 +136,26 @@ Run these in PowerShell, in this folder.
    ```
    fly volumes create creme_data --region syd --size 1 --yes
    ```
-5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step:
+5. Set the secrets. Same names as `.env.example`; real values, phone numbers in `+614…` format. Leave `APPROVER_PHONE_NUMBER` out to run with no approval step. Keep the single quotes: without them PowerShell cuts a value short at a `$` or `;`:
    ```
-   fly secrets set TWILIO_ACCOUNT_SID=... TWILIO_AUTH_TOKEN=... TWILIO_PHONE_NUMBER=... SUPPLIER_PHONE_NUMBER=... EMPLOYEE_PHONE_NUMBERS=...,... ANTHROPIC_API_KEY=... TRIGGER_KEY=... APPROVER_PHONE_NUMBER=...
+   fly secrets set 'TWILIO_ACCOUNT_SID=...' 'TWILIO_AUTH_TOKEN=...' 'TWILIO_PHONE_NUMBER=...' 'SUPPLIER_PHONE_NUMBER=...' 'EMPLOYEE_PHONE_NUMBERS=...,...' 'ANTHROPIC_API_KEY=...' 'TRIGGER_KEY=...' 'APPROVER_PHONE_NUMBER=...'
    ```
+   Then `fly secrets list` should show all eight names (seven without the approver). With `TWILIO_AUTH_TOKEN` missing the bot refuses every incoming text.
 6. Deploy. The build runs the test suite inside the image and stops if it fails:
    ```
    fly deploy --ha=false
    ```
-7. Check there is exactly one machine. If it shows two, run `fly scale count 1`:
+7. Check there is exactly one machine, and one volume attached to it. If it shows two machines, run `fly scale count 1`:
    ```
    fly scale show
+   fly volumes list
    ```
 8. In Twilio, set the number's **"A message comes in"** to `https://creme-supplier-bot.fly.dev/sms` (POST).
 9. Watch it start. You should see "Scheduler started":
    ```
    fly logs
    ```
+10. Prove a text gets in and out. From a staff phone, text a stock count to the Twilio number. A reply listing the counts means Twilio reached the bot, the signature check passed and the secrets are right. No reply, with "Invalid Twilio signature" in `fly logs`, means the request was refused: stop and fix that before relying on the bot.
 
 ### After that
 
@@ -162,11 +165,13 @@ Run these in PowerShell, in this folder.
 | See what it is doing | `fly logs` |
 | Change a secret (restarts the bot) | `fly secrets set NAME=value` |
 | End the approval trial | `fly secrets unset APPROVER_PHONE_NUMBER` |
-| Switch the bot off | `fly scale count 0 --yes` |
-| Switch it back on | `fly scale count 1 --yes`, then `fly scale show` |
+| Switch the bot off | `fly scale count 0 --yes` (the volume and its data stay) |
+| Switch it back on | `fly deploy --ha=false`, then `fly scale show` and `fly volumes list`: one machine, the same one volume, attached |
 | Roll back | `fly releases --image`, then `fly deploy --ha=false --image <the previous image>` |
 
 A deploy or a secret change restarts the bot. It picks up where it left off, but avoid doing it between 9:00 Wednesday and 9:00 Thursday, when an order may be waiting on a count or an approval.
+
+Switching off and back on has not been rehearsed on Fly yet. Do it once before the café relies on the bot, and text a count afterwards to confirm the stock counts are still there. If a second, empty volume appears, the bot has lost its memory of the week: switch it off again and sort that out first.
 
 Fly snapshots the volume daily and keeps five days. `fly volumes snapshots list <volume id>` shows them.
 
@@ -190,7 +195,13 @@ python trigger_order.py
 
 This fires the full order flow immediately — sends real SMS to supplier and employees.
 
-On the deployed server the same job runs from `https://your-app.railway.app/trigger?key=<TRIGGER_KEY>`.
+On the deployed server the same job runs from `https://creme-supplier-bot.fly.dev/trigger`, with the key sent as a header so it is not written to the logs:
+
+```
+curl.exe -H "X-Trigger-Key: <TRIGGER_KEY>" https://creme-supplier-bot.fly.dev/trigger
+```
+
+The key also works as `?key=` in the address, but then it is logged with the request; if that happens, change `TRIGGER_KEY`.
 If this week's order (Wednesday to Tuesday) is already handled the job skips rather than ordering twice;
 add `&force=1` to send anyway. A forced send within 10 minutes of the last order is refused.
 
