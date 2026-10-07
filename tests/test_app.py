@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from datetime import date, datetime, timedelta, timezone
@@ -832,6 +833,16 @@ BOSS = "+61400000009"
 STAFF_WAITING = "waiting for approval"
 
 
+def _later():
+    """Wait for the clock to move on. The bot orders events by their timestamps (a count
+    taken after the boss's no, a run logged after it), and in the cafe those are minutes
+    apart. In a test they are microseconds apart, and where the clock only ticks every
+    16 ms (Windows) two of them can carry the same timestamp and the order is lost."""
+    started = datetime.now(timezone.utc)
+    while datetime.now(timezone.utc) == started:
+        time.sleep(0.001)
+
+
 @pytest.fixture
 def boss(bot, sms, monkeypatch):
     """Approval switched on, with a boss who is not one of the staff numbers. Returns a
@@ -840,7 +851,10 @@ def boss(bot, sms, monkeypatch):
     client = app_module.app.test_client()
 
     def text(body, sender=BOSS):
-        return client.post("/sms", data={"From": sender, "Body": body}).get_data(as_text=True)
+        _later()  # the boss answers after they were asked ...
+        reply = client.post("/sms", data={"From": sender, "Body": body}).get_data(as_text=True)
+        _later()  # ... and whatever happens next comes after their answer
+        return reply
 
     return text
 
@@ -1201,6 +1215,7 @@ def _order_waiting_for_the_boss(bot):
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
     assert app_module.run_weekly_order() == app_module.OUTCOME_AWAITING_APPROVAL
     bot.clear()
+    _later()  # whatever the test does to this order next happens after it was asked
     return storage.get_pending_approval()
 
 
@@ -1465,7 +1480,9 @@ def test_a_boss_who_also_counts_stock_has_a_recount_starting_with_no_saved_as_a_
     storage.save_stock_report(STAFF[0], "count", LOW_STOCK)
     app_module.run_weekly_order()
     client = app_module.app.test_client()
+    _later()
     client.post("/sms", data={"From": STAFF[0], "Body": "no"})  # their own no: recount asked
+    _later()
     bot.clear()
 
     reply = sms("No almond left, oat 6, rest full", {**RECOUNT, "almond_milk": StockLevel("almond_milk", 0, "boxes")}, sender=STAFF[0])

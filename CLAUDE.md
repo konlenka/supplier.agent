@@ -125,6 +125,11 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
   test mode. For the first deploy the supplier and staff numbers are set to Christian's mobile, the
   tests are run on a day other than Wednesday, and the database is deleted before the real numbers
   go in (README → First deploy, steps 10 to 12). After go-live the database is never deleted.
+- The approval tests wait for the clock to move between events (`_later()` in `tests/test_app.py`).
+  The bot orders a no, a recount and a run by their timestamps; in the café those are minutes
+  apart, but in a test on Windows (clock ticks every 16 ms) two could share a timestamp, and on
+  7 Oct the suite failed about 3 runs in 4 for that reason alone. A new test that fires a no or a
+  recount straight after a request needs the same wait.
 - Deploy-config mutation check, 6 Oct: 33 deliberate breakages of `fly.toml`, the `Dockerfile`,
   `.dockerignore` and the lines of code they depend on, each caught by `tests/test_deploy_config.py`.
 - The packages the code imports are pinned in `requirements.txt` to the versions the suite passes
