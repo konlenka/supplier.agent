@@ -14,8 +14,11 @@ You are the developer on this build. Christian leads and approves. Follow
 touches something that sends an SMS, so the review gate (§6) applies to every merge.
 
 ## Context: where truth lives
-- Business status: Notion → Clients & Projects → Engagements → Supplier bot
-- Handover list: Notion → Crème Handover
+- Business status: Notion → Pipeline. Crème Café's page under Companies says which stage the café is
+  at; the Supplier bot row in Engagements says where this build is up to
+  (https://app.notion.com/p/3df62657991c812d9bafec713412494b)
+- Handover list: Notion → Pipeline → Companies → Crème Café → Crème Handover
+  (https://app.notion.com/p/3dd62657991c803f9f60eaee33e85563)
 - Client data in this folder: `data/stock.db` (stock reports with staff phone numbers, order history,
   run log) and `.env` (staff and supplier numbers). Both gitignored.
 
@@ -177,7 +180,8 @@ touches something that sends an SMS, so the review gate (§6) applies to every m
 ## Handover (for the next person, or the client)
 - Accounts (Fly.io, Twilio, Anthropic, GitHub `konlenka/supplier.agent`) are in Christian's name, at
   the owner's request (6 Oct 2026: the owner does not want to open accounts). The café can have its
-  data and its phone number on request. Status lives in Notion → Crème Handover.
+  data and its phone number on request. Status lives on the Crème Handover page in Notion (path
+  under "Context" above).
 - Where secrets live: `.env` locally, `fly secrets` in production.
 - The volume, the port (5000), the region and the start command are all in this repo now
   (`fly.toml`, `Dockerfile`). What is not in the repo: the number of machines. That is set by how
